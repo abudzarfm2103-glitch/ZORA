@@ -1,0 +1,20 @@
+# Rahasia
+.env
+.env.*
+!.env.example
+
+# Database dan data internal ZORA
+/data/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Backup dan log
+backups/
+logs/
+
+# Sistem
+.DS_Store
