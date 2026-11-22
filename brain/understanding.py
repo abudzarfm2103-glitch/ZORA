@@ -1,4 +1,3 @@
-
 from memory.memory_relationship import MemoryRelationship
 
 
@@ -11,7 +10,7 @@ class ZoraUnderstanding:
     def extract_answer(self, content, prefix):
         text = content.strip()
 
-        if text.lower().startswith(prefix):
+        if text.lower().startswith(prefix.lower()):
             return text[len(prefix):].strip()
 
         return text
@@ -27,17 +26,41 @@ class ZoraUnderstanding:
 
         return relationships
 
+    def get_unique_objects(self, items):
+        unique = {}
+
+        for item in items:
+            value = item.get("object")
+
+            if not isinstance(value, str):
+                continue
+
+            value = value.strip()
+
+            if value:
+                unique.setdefault(value.casefold(), item)
+
+        return list(unique.values())
+
+    def conflict_answer(self, subject):
+        return (
+            f"Saya menemukan beberapa informasi {subject} "
+            "yang berbeda di memori. Saya belum bisa memastikan "
+            "mana yang benar. Mohon konfirmasi informasi terbaru."
+        )
+
     def understand(self, message):
+        if not isinstance(message, str):
+            return None
 
         text = message.lower().strip()
 
-        # Pertanyaan khusus tentang jabatan
+        # Pertanyaan tentang jabatan.
         if any(word in text for word in [
             "apa jabatan saya",
             "jabatan saya apa",
             "jabatan saya sekarang"
         ]):
-
             relationships = self.get_relationships(
                 "bekerja_sebagai"
             )
@@ -47,12 +70,17 @@ class ZoraUnderstanding:
                 if item["status"] == "fakta"
             ]
 
+            facts = self.get_unique_objects(facts)
+
+            if len(facts) > 1:
+                return self.conflict_answer("jabatan")
+
             if facts:
                 return f"Jabatan Anda adalah {facts[0]['object']}."
 
             return "Saya belum mengetahui jabatan Anda."
 
-        # Pertanyaan tentang tempat kerja
+        # Pertanyaan tentang pekerjaan dan tempat kerja.
         if any(word in text for word in [
             "di mana saya bekerja",
             "dimana saya bekerja",
@@ -61,7 +89,6 @@ class ZoraUnderstanding:
             "pekerjaan saya",
             "apa pekerjaan saya"
         ]):
-
             relationships = self.get_relationships(
                 "bekerja_sebagai"
             )
@@ -71,25 +98,36 @@ class ZoraUnderstanding:
                 if item["status"] == "fakta"
             ]
 
+            facts = self.get_unique_objects(facts)
+
+            if len(facts) > 1:
+                return self.conflict_answer("pekerjaan")
+
             if facts:
                 item = facts[0]
-
-                answer = f"Anda bekerja sebagai {item['object']}."
+                answer = (
+                    f"Anda bekerja sebagai {item['object']}."
+                )
 
                 if item.get("location"):
-                    answer += f" Tempat kerja Anda adalah {item['location']}."
+                    answer += (
+                        f" Tempat kerja Anda adalah "
+                        f"{item['location']}."
+                    )
 
                 return answer
 
-            return "Saya belum memiliki informasi pekerjaan yang jelas."
+            return (
+                "Saya belum memiliki informasi pekerjaan "
+                "yang jelas."
+            )
 
-        # Mengenali nama
+        # Mengenali nama pengguna.
         if any(word in text for word in [
             "nama saya",
             "siapa nama saya",
             "siapa nama pengguna"
         ]):
-
             data = self.memory.recall()
 
             for item in data:
@@ -100,11 +138,13 @@ class ZoraUnderstanding:
                         content,
                         "nama saya"
                     )
-                    return f"Nama Anda {answer.rstrip('.')}."
+                    return (
+                        f"Nama Anda {answer.rstrip('.')}."
+                    )
 
             return "Saya belum mengetahui nama Anda."
 
-        # Mengenali lokasi operasional ZORA
+        # Mengenali lokasi operasional ZORA.
         if "zora" in text and any(word in text for word in [
             "di mana",
             "dimana",
@@ -112,45 +152,84 @@ class ZoraUnderstanding:
             "berjalan",
             "beroperasi"
         ]):
+            relationships = self.get_relationships()
 
-            relationships = self.get_relationships(
-                "direncanakan_berjalan_di"
-            )
+            facts = [
+                item for item in relationships
+                if (
+                    item["subject"] == "ZORA"
+                    and item["relation"] == "berjalan_di"
+                    and item["status"] == "fakta"
+                )
+            ]
 
-            if any(word in text for word in [
+            plans = [
+                item for item in relationships
+                if (
+                    item["subject"] == "ZORA"
+                    and item["relation"] == "direncanakan_berjalan_di"
+                    and item["status"] == "rencana"
+                )
+            ]
+
+            facts = self.get_unique_objects(facts)
+            plans = self.get_unique_objects(plans)
+
+            asks_current = any(word in text for word in [
                 "sudah",
                 "sekarang",
-                "saat ini"
-            ]):
+                "saat ini",
+                "sudah berjalan",
+                "sudah beroperasi"
+            ])
 
-                if relationships:
+            if len(facts) > 1:
+                return self.conflict_answer(
+                    "lokasi operasional ZORA"
+                )
+
+            if facts:
+                return (
+                    f"ZORA saat ini berjalan di "
+                    f"{facts[0]['object']}."
+                )
+
+            if asks_current:
+                if plans:
                     return (
-                        "ZORA belum memiliki status berjalan yang "
-                        "terkonfirmasi dalam memori saya. "
-                        f"Lokasi yang direncanakan adalah "
-                        f"{relationships[0]['object']}."
+                        "ZORA belum memiliki lokasi berjalan "
+                        "yang terkonfirmasi. Lokasi yang "
+                        f"direncanakan adalah {plans[0]['object']}."
                     )
 
-                return "Saya belum mengetahui lokasi operasional ZORA."
+                return (
+                    "Saya belum mengetahui lokasi operasional "
+                    "ZORA yang sudah terkonfirmasi."
+                )
 
-            if relationships:
+            if plans:
+                if len(plans) > 1:
+                    return self.conflict_answer(
+                        "rencana lokasi ZORA"
+                    )
+
                 return (
                     "Berdasarkan rencana yang tersimpan, "
                     f"ZORA nantinya akan berjalan di "
-                    f"{relationships[0]['object']}. "
-                    "Statusnya masih rencana."
+                    f"{plans[0]['object']}. Statusnya masih rencana."
                 )
 
-            return "Saya belum mengetahui rencana lokasi operasional ZORA."
+            return (
+                "Saya belum mengetahui lokasi operasional ZORA."
+            )
 
-        # Mengenali proyek yang sedang dikembangkan
+        # Mengenali proyek yang sedang dikembangkan.
         if any(word in text for word in [
             "apa yang sedang saya kembangkan",
             "proyek saya",
             "apa proyek saya",
             "apa yang sedang saya buat"
         ]):
-
             data = self.memory.recall("proyek")
 
             for item in data:
@@ -163,9 +242,13 @@ class ZoraUnderstanding:
                     )
 
                     return (
-                        f"Anda sedang mengembangkan {answer.rstrip('.')}."
+                        f"Anda sedang mengembangkan "
+                        f"{answer.rstrip('.')}."
                     )
 
-            return "Saya belum mengetahui proyek yang sedang Anda kembangkan."
+            return (
+                "Saya belum mengetahui proyek yang "
+                "sedang Anda kembangkan."
+            )
 
         return None

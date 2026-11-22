@@ -1,4 +1,5 @@
 import ast
+import os
 import sys
 from pathlib import Path
 
@@ -13,6 +14,7 @@ from brain.zora import Zora
 class ZoraSelfRepair:
 
     MAX_ATTEMPTS = 3
+    MAX_ERROR_MESSAGE = 2000
 
     def __init__(self, zora, max_attempts=3):
         self.zora = zora
@@ -78,42 +80,89 @@ class ZoraSelfRepair:
             print("File percobaan yang gagal telah dibersihkan.")
             return True
 
-        except (OSError, ValueError, PermissionError, TypeError) as error:
+        except Exception as error:
             print(
                 "Peringatan: file gagal dibersihkan:",
-                str(error)
+                str(error)[:self.MAX_ERROR_MESSAGE]
             )
             return False
 
+    def _failure(self, message, attempts=0):
+        return {
+            "success": False,
+            "message": str(message)[:self.MAX_ERROR_MESSAGE],
+            "attempts": attempts
+        }
+
+    def _safe_generate(self, instruction):
+        try:
+            result = self.zora.generate_code(instruction)
+
+            if not isinstance(result, dict):
+                return self._failure(
+                    "Respons generator kode tidak valid."
+                )
+
+            return result
+
+        except Exception as error:
+            return self._failure(
+                f"Generator mengalami kesalahan: {error}"
+            )
+
+    def _safe_write(self, filename, code):
+        try:
+            result = self.zora.execution.write_file(
+                filename,
+                code
+            )
+
+            if not isinstance(result, dict):
+                return self._failure(
+                    "Respons penyimpanan file tidak valid."
+                )
+
+            return result
+
+        except Exception as error:
+            return self._failure(
+                f"Penyimpanan file gagal: {error}"
+            )
+
+    def _safe_test(self, filename):
+        try:
+            result = self.zora.execution.test_code(filename)
+
+            if not isinstance(result, dict):
+                return self._failure(
+                    "Hasil pengujian Sandbox tidak valid."
+                )
+
+            return result
+
+        except Exception as error:
+            return self._failure(
+                f"Pengujian Sandbox mengalami kesalahan: {error}"
+            )
+
     def run(self, instruction, filename, initial_code=None):
         if not isinstance(instruction, str) or not instruction.strip():
-            return {
-                "success": False,
-                "message": "Instruksi perbaikan tidak valid."
-            }
+            return self._failure(
+                "Instruksi perbaikan tidak valid."
+            )
 
         try:
             target = self.zora.execution.validate_path(filename)
-        except (ValueError, PermissionError, OSError) as error:
-            return {
-                "success": False,
-                "message": str(error)
-            }
+        except Exception as error:
+            return self._failure(error)
 
-        if target.exists():
-            return {
-                "success": False,
-                "message": "File sudah tersedia. Tidak akan ditimpa."
-            }
+        if target.exists() or target.is_symlink():
+            return self._failure(
+                "File sudah tersedia. Tidak akan ditimpa."
+            )
 
         if initial_code is None:
-            generated = self.zora.generate_code(instruction)
-
-            if not isinstance(generated, dict):
-                return {
-                    "success": False,
-                    "message": "Respons generator kode tidak valid."
-                }
+            generated = self._safe_generate(instruction)
 
             if not generated.get("success"):
                 return generated
@@ -124,62 +173,83 @@ class ZoraSelfRepair:
 
         try:
             self.validate_code(code)
-        except (
-            SyntaxError,
-            ValueError,
-            PermissionError,
-            TypeError,
-            UnicodeError
-        ) as error:
-            return {
-                "success": False,
-                "message": f"Kode awal ditolak: {error}"
-            }
+        except Exception as error:
+            return self._failure(
+                f"Kode awal ditolak: {error}"
+            )
 
-        created = self.zora.execution.create_file(filename)
+        created = False
+        success = False
+        attempts = 0
 
-        if not created.get("success"):
-            return created
+        try:
+            # Buat file secara eksklusif.
+            # Status kepemilikan langsung dicatat setelah os.open berhasil.
+            try:
+                descriptor = os.open(
+                    target,
+                    os.O_CREAT | os.O_EXCL | os.O_WRONLY,
+                    0o600
+                )
+                created = True
+            except FileExistsError:
+                return self._failure(
+                    "File sudah tersedia. Tidak akan ditimpa."
+                )
+            except Exception as error:
+                return self._failure(
+                    f"Pembuatan file gagal: {error}"
+                )
 
-        saved = self.zora.execution.write_file(filename, code)
+            try:
+                os.close(descriptor)
+            except Exception as error:
+                return self._failure(
+                    f"Penutupan file gagal: {error}"
+                )
 
-        if not saved.get("success"):
-            self.cleanup_created_file(target)
-            return saved
+            saved = self._safe_write(filename, code)
 
-        for attempt in range(self.max_attempts + 1):
-            print(f"\nPengujian ke-{attempt + 1}...")
+            if not saved.get("success"):
+                return self._failure(
+                    saved.get("message", "Penyimpanan file gagal.")
+                )
 
-            result = self.zora.execution.test_code(filename)
+            for test_number in range(1, self.max_attempts + 2):
+                attempts = test_number
 
-            if not isinstance(result, dict):
-                self.cleanup_created_file(target)
-                return {
-                    "success": False,
-                    "message": "Hasil pengujian Sandbox tidak valid.",
-                    "attempts": attempt + 1
-                }
+                print(f"\nPengujian ke-{test_number}...")
 
-            if result.get("success"):
-                return {
-                    "success": True,
-                    "message": "Kode berhasil diperbaiki dan diuji.",
-                    "attempts": attempt,
-                    "code": code,
-                    "output": result.get("output", "")
-                }
+                result = self._safe_test(filename)
 
-            if attempt == self.max_attempts:
-                break
+                if result.get("success"):
+                    success = True
 
-            error_message = str(
-                result.get("message", "Kesalahan tidak diketahui.")
-            )[:2000]
+                    print("LULUS: File berhasil dipertahankan")
 
-            print("Kesalahan ditemukan:", error_message)
-            print("ZORA sedang memperbaiki kode...")
+                    return {
+                        "success": True,
+                        "message": "Kode berhasil diperbaiki dan diuji.",
+                        "attempts": test_number,
+                        "code": code,
+                        "output": result.get("output", "")
+                    }
 
-            repair_instruction = f"""
+                error_message = str(
+                    result.get(
+                        "message",
+                        "Kesalahan tidak diketahui."
+                    )
+                )[:self.MAX_ERROR_MESSAGE]
+
+                print("Kesalahan ditemukan:", error_message)
+
+                if test_number > self.max_attempts:
+                    break
+
+                print("ZORA sedang memperbaiki kode...")
+
+                repair_instruction = f"""
 Perbaiki kode Python berikut berdasarkan tujuan dan kesalahan pengujian.
 
 Tujuan program:
@@ -197,52 +267,52 @@ Ikuti seluruh batasan Sandbox.
 Hasilkan hanya kode Python.
 """
 
-            repaired = self.zora.generate_code(repair_instruction)
+                repaired = self._safe_generate(repair_instruction)
 
-            if not isinstance(repaired, dict) or not repaired.get("success"):
+                if not repaired.get("success"):
+                    return self._failure(
+                        repaired.get(
+                            "message",
+                            "Generator gagal memperbaiki kode."
+                        ),
+                        attempts
+                    )
+
+                new_code = repaired.get("code")
+
+                try:
+                    self.validate_code(new_code)
+                except Exception as error:
+                    print(
+                        "Kode perbaikan ditolak:",
+                        str(error)[:self.MAX_ERROR_MESSAGE]
+                    )
+                    continue
+
+                saved = self._safe_write(filename, new_code)
+
+                if not saved.get("success"):
+                    return self._failure(
+                        saved.get("message", "Penyimpanan file gagal."),
+                        attempts
+                    )
+
+                code = new_code
+
+            return self._failure(
+                "ZORA belum berhasil memperbaiki kode setelah batas percobaan.",
+                attempts
+            )
+
+        except Exception as error:
+            return self._failure(
+                f"Proses perbaikan mengalami kesalahan: {error}",
+                attempts
+            )
+
+        finally:
+            if created and not success:
                 self.cleanup_created_file(target)
-                return {
-                    "success": False,
-                    "message": (
-                        repaired.get("message", "Generator gagal.")
-                        if isinstance(repaired, dict)
-                        else "Respons generator tidak valid."
-                    ),
-                    "attempts": attempt + 1
-                }
-
-            new_code = repaired.get("code")
-
-            try:
-                self.validate_code(new_code)
-            except (
-                SyntaxError,
-                ValueError,
-                PermissionError,
-                TypeError,
-                UnicodeError
-            ) as error:
-                print("Kode perbaikan ditolak:", str(error))
-                continue
-
-            saved = self.zora.execution.write_file(filename, new_code)
-
-            if not saved.get("success"):
-                self.cleanup_created_file(target)
-                return saved
-
-            code = new_code
-
-        self.cleanup_created_file(target)
-
-        return {
-            "success": False,
-            "message": (
-                "ZORA belum berhasil memperbaiki kode "
-                "setelah batas percobaan."
-            ),
-            "attempts": self.max_attempts
-        }
 
 
 def main():

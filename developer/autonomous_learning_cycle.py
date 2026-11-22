@@ -191,7 +191,7 @@ def main():
     try:
 
         history = ZoraDevelopmentHistory()
-        generator = ZoraDecisionTaskGenerator()
+        generator = ZoraDecisionTaskGenerator(zora=zora)
 
         executor = ZoraAutonomousTaskExecutor(
             zora,

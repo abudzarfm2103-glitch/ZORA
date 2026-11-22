@@ -1,4 +1,3 @@
-
 class MemoryRelationship:
 
     STATUS_PRIORITY = {
@@ -12,7 +11,6 @@ class MemoryRelationship:
         self.memory = memory
 
     def extract_work_relationship(self, content, status):
-
         text = content.lower().strip()
 
         prefixes = [
@@ -21,9 +19,7 @@ class MemoryRelationship:
         ]
 
         for prefix in prefixes:
-
             if text.startswith(prefix):
-
                 detail = content[len(prefix):].strip()
 
                 if " di " in detail.lower():
@@ -48,49 +44,54 @@ class MemoryRelationship:
         return None
 
     def extract_project_relationship(self, content, status):
-
         text = content.lower()
 
         patterns = [
             "zora nantinya akan berjalan di",
+            "zora sekarang beroperasi di",
+            "zora sudah beroperasi di",
+            "zora saat ini beroperasi di",
+            "zora sekarang berjalan di",
+            "zora sudah berjalan di",
+            "zora saat ini berjalan di",
             "zora akan berjalan di",
-            "zora berjalan di",
-            "zora beroperasi di"
+            "zora beroperasi di",
+            "zora berjalan di"
         ]
 
         for pattern in patterns:
+            position = text.find(pattern)
 
-            if pattern in text:
+            if position == -1:
+                continue
 
-                position = text.find(pattern)
+            location_start = position + len(pattern)
+            location = content[location_start:].strip(
+                " .,!?:;"
+            )
 
-                location = content[
-                    position + len(pattern):
-                ].strip(" .,!?:;")
+            if not location:
+                continue
 
-                if location:
+            relation = "direncanakan_berjalan_di"
 
-                    relation = "direncanakan_berjalan_di"
+            if status == "fakta":
+                relation = "berjalan_di"
 
-                    if status == "fakta":
-                        relation = "berjalan_di"
-
-                    return {
-                        "subject": "ZORA",
-                        "relation": relation,
-                        "object": location,
-                        "status": status
-                    }
+            return {
+                "subject": "ZORA",
+                "relation": relation,
+                "object": location,
+                "status": status
+            }
 
         return None
 
     def build_relationships(self):
-
         memories = self.memory.recall_details()
         selected = {}
 
         for content, category, status, created_at in memories:
-
             relationship = None
 
             if category == "pekerjaan":
@@ -108,8 +109,6 @@ class MemoryRelationship:
             if not relationship:
                 continue
 
-            # Lokasi tidak dijadikan pembeda untuk
-            # jabatan pekerjaan yang sama.
             key = (
                 relationship["subject"],
                 relationship["relation"],
@@ -123,7 +122,10 @@ class MemoryRelationship:
                 continue
 
             old_status = selected[key]["status"]
-            old_priority = self.STATUS_PRIORITY.get(old_status, 0)
+            old_priority = self.STATUS_PRIORITY.get(
+                old_status,
+                0
+            )
 
             if priority > old_priority:
                 selected[key] = relationship
@@ -131,18 +133,20 @@ class MemoryRelationship:
         return list(selected.values())
 
     def show_relationships(self):
-
         relationships = self.build_relationships()
 
         if not relationships:
-            return "Belum ada hubungan informasi yang dapat dikenali."
+            return (
+                "Belum ada hubungan informasi "
+                "yang dapat dikenali."
+            )
 
-        results = ["Hubungan informasi yang saya pahami:"]
+        results = [
+            "Hubungan informasi yang saya pahami:"
+        ]
 
         for item in relationships:
-
             if item["relation"] == "bekerja_sebagai":
-
                 results.append(
                     f"- {item['subject']} bekerja sebagai "
                     f"{item['object']}"
@@ -152,9 +156,7 @@ class MemoryRelationship:
                     results.append(
                         f"  Tempat kerja: {item['location']}"
                     )
-
             else:
-
                 results.append(
                     f"- {item['subject']} "
                     f"{item['relation']} "

@@ -1,3 +1,5 @@
+import re
+
 
 class MemoryFilter:
 
@@ -22,11 +24,21 @@ class MemoryFilter:
             "proyek saya",
             "saya sedang mengembangkan",
             "saya sedang membuat",
+            "saya ingin mengembangkan",
+            "saya ingin membuat",
+            "ingin mengembangkan",
+            "ingin membuat",
             "zora nantinya akan berjalan",
             "zora akan berjalan",
-            "server zora",
             "zora berjalan di",
-            "zora beroperasi di"
+            "zora beroperasi di",
+            "zora sekarang berjalan di",
+            "zora sudah berjalan di",
+            "zora saat ini berjalan di",
+            "zora sekarang beroperasi di",
+            "zora sudah beroperasi di",
+            "zora saat ini beroperasi di",
+            "server zora"
         ],
 
         "preferensi": [
@@ -75,24 +87,39 @@ class MemoryFilter:
         "saya sedang membuat",
         "saya suka",
         "saya lebih suka",
-        "saya tidak suka"
+        "saya tidak suka",
+        "zora sekarang berjalan",
+        "zora sudah berjalan",
+        "zora saat ini berjalan",
+        "zora sekarang beroperasi",
+        "zora sudah beroperasi",
+        "zora saat ini beroperasi"
     ]
 
-    def determine_status(self, text):
+    def contains_phrase(self, text, phrase):
+        pattern = (
+            r"(?<!\w)"
+            + re.escape(phrase)
+            + r"(?!\w)"
+        )
+        return re.search(pattern, text) is not None
 
+    def determine_status(self, text):
         lower_text = text.lower()
 
         for word in self.PLAN_WORDS:
-            if word in lower_text:
+            if self.contains_phrase(lower_text, word):
                 return "rencana"
 
         for pattern in self.FACT_PATTERNS:
-            if pattern in lower_text:
+            if self.contains_phrase(lower_text, pattern):
                 return "fakta"
 
         return "belum_diklasifikasikan"
 
     def analyze(self, message):
+        if not isinstance(message, str):
+            return None
 
         text = " ".join(message.strip().split())
         lower_text = text.lower()
@@ -104,10 +131,8 @@ class MemoryFilter:
             return None
 
         for category, keywords in self.KEYWORDS.items():
-
             for keyword in keywords:
-
-                if keyword in lower_text:
+                if self.contains_phrase(lower_text, keyword):
                     return {
                         "content": text,
                         "category": category,

@@ -1,4 +1,5 @@
 from collections import OrderedDict
+from contextlib import contextmanager
 import secrets
 import threading
 
@@ -16,7 +17,6 @@ from brain.zora import Zora
 app = Flask(__name__)
 
 # Kunci acak berlaku selama proses server berjalan.
-# Sesi browser akan dibuat ulang setelah server dimulai ulang.
 app.secret_key = secrets.token_hex(32)
 
 app.config.update(
@@ -204,6 +204,7 @@ def _close_zora(zora):
         app.logger.exception("Gagal menutup memori sesi ZORA")
 
 
+@contextmanager
 def get_zora_for_session():
     session_id = session.get("zora_session_id")
 
@@ -211,31 +212,43 @@ def get_zora_for_session():
         session_id = secrets.token_urlsafe(32)
         session["zora_session_id"] = session_id
 
-    with _sessions_lock:
+    record = None
+    acquired = False
 
-        record = _sessions.get(session_id)
+    try:
+        # Pengambilan sesi dan penguncian harus atomik terhadap eviction.
+        with _sessions_lock:
 
-        if record is not None:
-            _sessions.move_to_end(session_id)
-            return record
+            record = _sessions.get(session_id)
 
-        zora = Zora()
+            if record is None:
+                record = {
+                    "zora": Zora(),
+                    "lock": threading.RLock()
+                }
+                _sessions[session_id] = record
+            else:
+                _sessions.move_to_end(session_id)
 
-        record = {
-            "zora": zora,
-            "lock": threading.RLock()
-        }
+            # Kunci sesi diperoleh sebelum lock global dilepas.
+            record["lock"].acquire()
+            acquired = True
 
-        _sessions[session_id] = record
+            # Sesi yang sedang digunakan tidak akan dikeluarkan
+            # sebelum pemrosesan pesannya selesai.
+            while len(_sessions) > max(1, MAX_SESSIONS):
 
-        while len(_sessions) > MAX_SESSIONS:
-            old_id, old_record = _sessions.popitem(last=False)
+                old_id, old_record = _sessions.popitem(last=False)
 
-            if old_id != session_id:
-                with old_record["lock"]:
-                    _close_zora(old_record["zora"])
+                if old_id != session_id:
+                    with old_record["lock"]:
+                        _close_zora(old_record["zora"])
 
-        return record
+        yield record
+
+    finally:
+        if acquired:
+            record["lock"].release()
 
 
 @app.route("/")
@@ -262,10 +275,8 @@ def chat():
         }), 413
 
     try:
-        record = get_zora_for_session()
-
-        # Satu sesi hanya memproses satu pesan pada satu waktu.
-        with record["lock"]:
+        # Sesi dikunci sejak diambil sampai pesan selesai diproses.
+        with get_zora_for_session() as record:
             jawaban = record["zora"].process_message(message)
 
         return jsonify({

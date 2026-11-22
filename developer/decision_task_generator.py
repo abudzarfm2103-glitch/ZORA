@@ -4,10 +4,14 @@ import hashlib
 import os
 import re
 import tempfile
+import fcntl
+from contextlib import contextmanager
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(ROOT))
+
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 from developer.skill_discovery import ZoraSkillDiscovery
 from developer.skill_prioritization import ZoraSkillPrioritization
@@ -19,7 +23,8 @@ class ZoraDecisionTaskGenerator:
     MAX_HISTORY_ITEMS = 5000
     MAX_TASK_BYTES = 65536
 
-    def __init__(self, task_file=None, history_file=None):
+    def __init__(self, task_file=None, history_file=None, zora=None):
+        self.zora = zora
 
         data_dir = ROOT / "data"
 
@@ -46,8 +51,26 @@ class ZoraDecisionTaskGenerator:
             }
         }
 
-    def _validate_history(self, history):
+    @contextmanager
+    def _history_lock(self):
+        self.history_file.parent.mkdir(
+            parents=True,
+            exist_ok=True
+        )
 
+        lock_file = self.history_file.with_name(
+            self.history_file.name + ".lock"
+        )
+
+        with lock_file.open("a+b") as file:
+            fcntl.flock(file.fileno(), fcntl.LOCK_EX)
+
+            try:
+                yield
+            finally:
+                fcntl.flock(file.fileno(), fcntl.LOCK_UN)
+
+    def _validate_history(self, history):
         if not isinstance(history, list):
             raise ValueError("Format riwayat tugas harus berupa daftar.")
 
@@ -55,7 +78,6 @@ class ZoraDecisionTaskGenerator:
             raise ValueError("Jumlah riwayat tugas melebihi batas.")
 
         for item in history:
-
             if not isinstance(item, dict):
                 raise ValueError("Ditemukan data riwayat yang tidak valid.")
 
@@ -68,14 +90,11 @@ class ZoraDecisionTaskGenerator:
             if not isinstance(fingerprint, str):
                 raise ValueError("Fingerprint riwayat tidak valid.")
 
-            if len(fingerprint) != 64 or not re.fullmatch(
-                r"[a-fA-F0-9]{64}", fingerprint
-            ):
+            if not re.fullmatch(r"[a-fA-F0-9]{64}", fingerprint):
                 raise ValueError("Format fingerprint riwayat tidak valid.")
 
             values = item.get("values")
 
-            # Mendukung format daftar baru dan format kamus lama.
             if not isinstance(values, (list, dict)):
                 raise ValueError("Nilai tugas pada riwayat tidak valid.")
 
@@ -91,11 +110,13 @@ class ZoraDecisionTaskGenerator:
         return history
 
     def load_history(self):
-
         if not self.history_file.exists():
             return []
 
         try:
+            if self.history_file.is_symlink():
+                raise ValueError("File riwayat tidak boleh berupa symlink.")
+
             size = self.history_file.stat().st_size
 
             if size > self.MAX_HISTORY_BYTES:
@@ -112,21 +133,8 @@ class ZoraDecisionTaskGenerator:
                 "Data asli tidak akan dianggap kosong."
             ) from error
 
-    def _atomic_write_json(self, path, data, max_size):
-
+    def _atomic_write_bytes(self, path, content):
         path = Path(path)
-
-        content = json.dumps(
-            data,
-            indent=4,
-            ensure_ascii=False
-        )
-
-        encoded = content.encode("utf-8")
-
-        if len(encoded) > max_size:
-            raise ValueError("Data yang akan disimpan melebihi batas ukuran.")
-
         path.parent.mkdir(parents=True, exist_ok=True)
 
         temporary_path = None
@@ -140,7 +148,7 @@ class ZoraDecisionTaskGenerator:
 
             temporary_path = Path(temporary_name)
 
-            with os.fdopen(descriptor, "w", encoding="utf-8") as file:
+            with os.fdopen(descriptor, "wb") as file:
                 file.write(content)
                 file.flush()
                 os.fsync(file.fileno())
@@ -152,8 +160,21 @@ class ZoraDecisionTaskGenerator:
             if temporary_path and temporary_path.exists():
                 temporary_path.unlink()
 
-    def save_history(self, history):
+    def _atomic_write_json(self, path, data, max_size):
+        content = json.dumps(
+            data,
+            indent=4,
+            ensure_ascii=False
+        ).encode("utf-8")
 
+        if len(content) > max_size:
+            raise ValueError(
+                "Data yang akan disimpan melebihi batas ukuran."
+            )
+
+        self._atomic_write_bytes(path, content)
+
+    def save_history(self, history):
         self._validate_history(history)
 
         self._atomic_write_json(
@@ -162,13 +183,18 @@ class ZoraDecisionTaskGenerator:
             self.MAX_HISTORY_BYTES
         )
 
-    def create_prioritizer(self):
-
+    def create_prioritizer(self, zora=None):
         from brain.zora import Zora
         from developer.self_development import ZoraSelfDevelopment
         from developer.development_planner import ZoraDevelopmentPlanner
 
-        zora = Zora()
+        if zora is None:
+            zora = self.zora
+
+        owns_zora = zora is None
+
+        if owns_zora:
+            zora = Zora()
 
         try:
             developer = ZoraSelfDevelopment(zora)
@@ -178,11 +204,11 @@ class ZoraDecisionTaskGenerator:
             return zora, ZoraSkillPrioritization(discovery)
 
         except Exception:
-            zora.memory.close()
+            if owns_zora:
+                zora.memory.close()
             raise
 
     def extract_json(self, response):
-
         if not isinstance(response, str):
             return None
 
@@ -195,12 +221,10 @@ class ZoraDecisionTaskGenerator:
         try:
             result = json.loads(response[start:end + 1])
             return result if isinstance(result, dict) else None
-
         except json.JSONDecodeError:
             return None
 
     def validate_source_task(self, proposal):
-
         if not isinstance(proposal, dict):
             return None
 
@@ -254,7 +278,6 @@ class ZoraDecisionTaskGenerator:
         }
 
     def create_source_task_with_ai(self, zora):
-
         history = self.load_history()
 
         previous_tasks = [
@@ -330,18 +353,163 @@ Jawab hanya JSON valid:
             return None
 
     def create_task_with_ai(self, zora, skill_id):
-
         if skill_id == "source_evaluation":
             return self.create_source_task_with_ai(zora)
 
         return None
 
-    def generate(self):
+    def _generate_locked(
+        self,
+        zora,
+        selected,
+        selected_id,
+        selected_name,
+        is_improvement,
+        skill_id
+    ):
+        print(
+            "\nZORA sedang merancang tugas baru untuk:",
+            selected_name
+        )
 
-        zora = None
+        task = self.create_task_with_ai(zora, skill_id)
+
+        if task is None:
+            return {
+                "success": False,
+                "message": (
+                    "AI belum menghasilkan tugas baru yang valid. "
+                    "Tidak menggunakan soal lama."
+                )
+            }
+
+        history = self.load_history()
+
+        if any(
+            item.get("fingerprint") == task["fingerprint"]
+            and item.get("skill_id") == skill_id
+            for item in history
+        ):
+            return {
+                "success": False,
+                "message": "Tugas tersebut sudah pernah digunakan."
+            }
+
+        if len(history) >= self.MAX_HISTORY_ITEMS:
+            return {
+                "success": False,
+                "message": "Riwayat tugas sudah mencapai batas."
+            }
+
+        criteria = dict(self.criteria[skill_id])
+        criteria["expected_output"] = task["expected_output"]
+        criteria["semantic_parameters"] = {
+            "nilai_sumber_a": task["values"][0],
+            "nilai_sumber_b": task["values"][1]
+        }
+
+        generated_task = {
+            "skill_id": skill_id,
+            "proposal_id": selected_id,
+            "skill_name": selected_name,
+            "objective": task["objective"],
+            "instruction": task["instruction"],
+            "expected_output": task["expected_output"],
+            "evaluation_criteria": criteria,
+            "priority_score": selected.get("total", 0),
+            "priority_rank": selected.get("rank", 0),
+            "decision_reason": (
+                "Dipilih untuk memperbaiki hasil pengujian sebelumnya."
+                if is_improvement
+                else "Dipilih berdasarkan evaluasi kemampuan."
+            ),
+            "development_type": (
+                "perbaikan" if is_improvement
+                else "pengembangan_baru"
+            ),
+            "task_source": "AI",
+            "status": "menunggu_pengembangan"
+        }
+
+        new_history = list(history)
+
+        new_history.append({
+            "skill_id": skill_id,
+            "fingerprint": task["fingerprint"],
+            "values": task["values"],
+            "objective": task["objective"],
+            "expected_output": task["expected_output"]
+        })
+
+        if self.task_file.is_symlink():
+            return {
+                "success": False,
+                "message": "File tugas tidak boleh berupa symlink."
+            }
+
+        previous_task = None
+
+        if self.task_file.exists():
+            if not self.task_file.is_file():
+                return {
+                    "success": False,
+                    "message": "Lokasi file tugas bukan file."
+                }
+
+            if self.task_file.stat().st_size > self.MAX_TASK_BYTES:
+                return {
+                    "success": False,
+                    "message": "File tugas lama melebihi batas ukuran."
+                }
+
+            previous_task = self.task_file.read_bytes()
 
         try:
-            zora, prioritizer = self.create_prioritizer()
+            # Simpan tugas terlebih dahulu.
+            self._atomic_write_json(
+                self.task_file,
+                generated_task,
+                self.MAX_TASK_BYTES
+            )
+
+            # Riwayat hanya diperbarui setelah tugas berhasil disimpan.
+            self.save_history(new_history)
+
+        except Exception as error:
+            try:
+                # Pulihkan file tugas seperti sebelum transaksi.
+                if previous_task is None:
+                    self.task_file.unlink(missing_ok=True)
+                else:
+                    self._atomic_write_bytes(
+                        self.task_file,
+                        previous_task
+                    )
+
+            except Exception as rollback_error:
+                return {
+                    "success": False,
+                    "message": (
+                        f"Penyimpanan gagal: {error}. "
+                        f"Pemulihan file tugas juga gagal: {rollback_error}. "
+                        "Periksa kedua file sebelum melanjutkan."
+                    )
+                }
+
+            raise
+
+        return {
+            "success": True,
+            "task": generated_task,
+            "fingerprint": task["fingerprint"]
+        }
+
+    def generate(self):
+        zora = self.zora
+        owns_zora = zora is None
+
+        try:
+            zora, prioritizer = self.create_prioritizer(zora)
 
             result = prioritizer.prioritize()
 
@@ -362,6 +530,8 @@ Jawab hanya JSON valid:
             if (
                 not isinstance(selected_id, str)
                 or not isinstance(selected_name, str)
+                or not selected_id.strip()
+                or not selected_name.strip()
             ):
                 raise ValueError("Identitas kemampuan tidak valid.")
 
@@ -382,92 +552,17 @@ Jawab hanya JSON valid:
                     )
                 }
 
-            print(
-                "\nZORA sedang merancang tugas baru untuk:",
-                selected_name
-            )
-
-            task = self.create_task_with_ai(zora, skill_id)
-
-            if task is None:
-                return {
-                    "success": False,
-                    "message": (
-                        "AI belum menghasilkan tugas baru yang valid. "
-                        "Tidak menggunakan soal lama."
-                    )
-                }
-
-            history = self.load_history()
-
-            if any(
-                item.get("fingerprint") == task["fingerprint"]
-                and item.get("skill_id") == skill_id
-                for item in history
-            ):
-                return {
-                    "success": False,
-                    "message": "Tugas tersebut sudah pernah digunakan."
-                }
-
-            if len(history) >= self.MAX_HISTORY_ITEMS:
-                return {
-                    "success": False,
-                    "message": "Riwayat tugas sudah mencapai batas."
-                }
-
-            criteria = dict(self.criteria[skill_id])
-            criteria["expected_output"] = task["expected_output"]
-            criteria["semantic_parameters"] = {
-                "nilai_sumber_a": task["values"][0],
-                "nilai_sumber_b": task["values"][1]
-            }
-
-            generated_task = {
-                "skill_id": skill_id,
-                "proposal_id": selected_id,
-                "skill_name": selected_name,
-                "objective": task["objective"],
-                "instruction": task["instruction"],
-                "expected_output": task["expected_output"],
-                "evaluation_criteria": criteria,
-                "priority_score": selected.get("total", 0),
-                "priority_rank": selected.get("rank", 0),
-                "decision_reason": (
-                    "Dipilih untuk memperbaiki hasil pengujian sebelumnya."
-                    if is_improvement
-                    else "Dipilih berdasarkan evaluasi kemampuan."
-                ),
-                "development_type": (
-                    "perbaikan" if is_improvement
-                    else "pengembangan_baru"
-                ),
-                "task_source": "AI",
-                "status": "menunggu_pengembangan"
-            }
-
-            # Catat fingerprint sebelum tugas dinyatakan berhasil dibuat.
-            history.append({
-                "skill_id": skill_id,
-                "fingerprint": task["fingerprint"],
-                "values": task["values"],
-                "objective": task["objective"],
-                "expected_output": task["expected_output"]
-            })
-
-            self.save_history(history)
-
-            self._atomic_write_json(
-                self.task_file,
-                generated_task,
-                self.MAX_TASK_BYTES
-            )
-
-            return {
-                "success": True,
-                "task": generated_task,
-                "fingerprint": task["fingerprint"]
-            }
+            # Kunci mencakup pembacaan, pembuatan, pemeriksaan,
+            # dan penyimpanan agar proses lain tidak memakai tugas sama.
+            with self._history_lock():
+                return self._generate_locked(
+                    zora,
+                    selected,
+                    selected_id,
+                    selected_name,
+                    is_improvement,
+                    skill_id
+                )
 
         except (ValueError, OSError) as error:
             return {
@@ -476,11 +571,13 @@ Jawab hanya JSON valid:
             }
 
         finally:
-            if zora is not None:
-                zora.memory.close()
+            if owns_zora and zora is not None:
+                try:
+                    zora.memory.close()
+                except Exception as error:
+                    print("Peringatan: memori gagal ditutup:", str(error))
 
     def report(self):
-
         result = self.generate()
 
         print("\nZORA AUTONOMOUS TASK GENERATOR")

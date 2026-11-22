@@ -263,7 +263,7 @@ class MemoryUpdate:
 def main():
     import tempfile
 
-    from memory import ZoraMemory
+    from memory.memory import ZoraMemory
 
     with tempfile.TemporaryDirectory() as folder:
         memory = ZoraMemory(Path(folder) / "test.db")
