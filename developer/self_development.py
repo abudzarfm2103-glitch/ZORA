@@ -16,10 +16,14 @@ class ZoraSelfDevelopment:
     MAX_HISTORY = 5000
     MAX_STATE_SIZE = 5 * 1024 * 1024
     MAX_FILENAME_ATTEMPTS = 10000
+    MAX_ERROR_MESSAGE = 2000
 
     def __init__(self, zora, state_file=None):
         self.zora = zora
-        self.repair = ZoraSelfRepair(zora, max_attempts=self.MAX_ATTEMPTS)
+        self.repair = ZoraSelfRepair(
+            zora,
+            max_attempts=self.MAX_ATTEMPTS
+        )
         self.evaluator = ZoraSelfEvaluation()
 
         self.state_file = (
@@ -93,29 +97,41 @@ class ZoraSelfDevelopment:
 
     def _validate_state(self, data):
         if not isinstance(data, dict):
-            raise ValueError("Format data pengembangan tidak valid.")
+            raise ValueError(
+                "Format data pengembangan tidak valid."
+            )
 
         completed = data.get("completed_prototypes", [])
         history = data.get("history", [])
 
         if not isinstance(completed, list):
-            raise ValueError("Daftar prototype selesai tidak valid.")
+            raise ValueError(
+                "Daftar prototype selesai tidak valid."
+            )
 
         if not isinstance(history, list):
-            raise ValueError("Riwayat pengembangan tidak valid.")
+            raise ValueError(
+                "Riwayat pengembangan tidak valid."
+            )
 
         if len(history) > self.MAX_HISTORY:
-            raise ValueError("Riwayat pengembangan melewati batas.")
+            raise ValueError(
+                "Riwayat pengembangan melewati batas."
+            )
 
         valid_ids = set(self.task_map)
 
         for item in completed:
             if not isinstance(item, str) or item not in valid_ids:
-                raise ValueError("ID prototype dalam progres tidak valid.")
+                raise ValueError(
+                    "ID prototype dalam progres tidak valid."
+                )
 
         for item in history:
             if not isinstance(item, dict):
-                raise ValueError("Format catatan riwayat tidak valid.")
+                raise ValueError(
+                    "Format catatan riwayat tidak valid."
+                )
 
         return {
             "completed_prototypes": list(dict.fromkeys(completed)),
@@ -144,6 +160,11 @@ class ZoraSelfDevelopment:
                 raise ValueError(
                     "File progres pengembangan rusak. "
                     "Data tidak akan direset atau ditimpa."
+                ) from error
+
+            except UnicodeError as error:
+                raise ValueError(
+                    "Encoding file progres pengembangan tidak valid."
                 ) from error
 
             except OSError as error:
@@ -185,7 +206,11 @@ class ZoraSelfDevelopment:
 
                 temporary_path = Path(temporary_name)
 
-                with os.fdopen(descriptor, "w", encoding="utf-8") as file:
+                with os.fdopen(
+                    descriptor,
+                    "w",
+                    encoding="utf-8"
+                ) as file:
                     file.write(serialized)
                     file.flush()
                     os.fsync(file.fileno())
@@ -237,7 +262,10 @@ class ZoraSelfDevelopment:
 
                     execution = self.zora.execution.test_code(filename)
 
-                    if not execution.get("success"):
+                    if not isinstance(execution, dict):
+                        continue
+
+                    if execution.get("success") is not True:
                         continue
 
                     evaluation = self.evaluator.evaluate(
@@ -246,17 +274,19 @@ class ZoraSelfDevelopment:
                         execution.get("output", "")
                     )
 
-                    if evaluation.get("success"):
+                    if not isinstance(evaluation, dict):
+                        continue
+
+                    if evaluation.get("success") is True:
                         verified.append(task["id"])
                         print("Terverifikasi:", task["name"])
                         break
 
-                except (
-                    OSError,
-                    ValueError,
-                    PermissionError,
-                    TypeError
-                ):
+                except Exception as error:
+                    print(
+                        "Peringatan verifikasi prototype:",
+                        type(error).__name__
+                    )
                     continue
 
         state["completed_prototypes"] = verified
@@ -303,10 +333,20 @@ class ZoraSelfDevelopment:
             if target.is_file():
                 target.unlink()
 
-        except (OSError, ValueError, PermissionError):
-            pass
+            return not target.exists()
 
-    def develop_next(self):
+        except (OSError, ValueError, PermissionError):
+            return False
+
+    def _error_message(self, stage, error):
+        message = (
+            f"{stage} mengalami exception "
+            f"({type(error).__name__}): {error}"
+        )
+
+        return message[:self.MAX_ERROR_MESSAGE]
+
+    def _develop_next_locked(self):
 
         progress = self.evaluate_progress()
         task = progress["next_task"]
@@ -321,8 +361,6 @@ class ZoraSelfDevelopment:
 
         print("Kebutuhan berikutnya:", task["name"])
 
-        state = self.load_state()
-
         final_result = None
         final_filename = None
         success = False
@@ -335,8 +373,17 @@ class ZoraSelfDevelopment:
 
             try:
                 filename = self._next_filename(task)
+
             except (OSError, ValueError, RuntimeError) as error:
-                feedback = str(error)
+                feedback = self._error_message(
+                    "Pembuatan nama file",
+                    error
+                )
+                final_result = {
+                    "success": False,
+                    "stage": "filename",
+                    "message": feedback
+                }
                 break
 
             print(f"\nPengembangan tujuan ke-{attempt}...")
@@ -352,28 +399,112 @@ class ZoraSelfDevelopment:
                     "Jangan mengulang kesalahan sebelumnya."
                 )
 
-            result = self.repair.run(
-                instruction=instruction,
-                filename=filename
-            )
-
-            final_result = result
-
-            if not result.get("success"):
-                feedback = result.get(
-                    "message",
-                    "Prototype gagal melewati Sandbox."
+            # Tahap 1: pembuatan dan pengujian sandbox.
+            try:
+                result = self.repair.run(
+                    instruction=instruction,
+                    filename=filename
                 )
+
+            except Exception as error:
+                feedback = self._error_message(
+                    "Repair",
+                    error
+                )
+
+                final_result = {
+                    "success": False,
+                    "stage": "repair",
+                    "message": feedback
+                }
 
                 self._remove_failed_prototype(filename)
                 print("Sandbox:", feedback)
                 continue
 
-            evaluation = self.evaluator.evaluate(
-                task["id"],
-                result.get("code", ""),
-                result.get("output", "")
-            )
+            if not isinstance(result, dict):
+                feedback = "Repair memberikan hasil dengan format tidak valid."
+
+                final_result = {
+                    "success": False,
+                    "stage": "repair",
+                    "message": feedback
+                }
+
+                self._remove_failed_prototype(filename)
+                print("Sandbox:", feedback)
+                continue
+
+            if result.get("success") is not True:
+                feedback = str(
+                    result.get(
+                        "message",
+                        "Prototype gagal melewati Sandbox."
+                    )
+                )[:self.MAX_ERROR_MESSAGE]
+
+                final_result = {
+                    "success": False,
+                    "stage": "repair",
+                    "message": feedback
+                }
+
+                self._remove_failed_prototype(filename)
+                print("Sandbox:", feedback)
+                continue
+
+            code = result.get("code", "")
+            output = result.get("output", "")
+
+            if not isinstance(code, str) or not isinstance(output, str):
+                feedback = "Repair menghasilkan kode atau output tidak valid."
+
+                final_result = {
+                    "success": False,
+                    "stage": "repair",
+                    "message": feedback
+                }
+
+                self._remove_failed_prototype(filename)
+                continue
+
+            # Tahap 2: evaluasi hasil prototype.
+            try:
+                evaluation = self.evaluator.evaluate(
+                    task["id"],
+                    code,
+                    output
+                )
+
+            except Exception as error:
+                feedback = self._error_message(
+                    "Self-evaluation",
+                    error
+                )
+
+                final_result = {
+                    "success": False,
+                    "stage": "evaluation",
+                    "message": feedback
+                }
+
+                self._remove_failed_prototype(filename)
+                print("Evaluasi:", feedback)
+                continue
+
+            if not isinstance(evaluation, dict):
+                feedback = (
+                    "Self-evaluation memberikan format hasil tidak valid."
+                )
+
+                final_result = {
+                    "success": False,
+                    "stage": "evaluation",
+                    "message": feedback
+                }
+
+                self._remove_failed_prototype(filename)
+                continue
 
             print("HASIL SELF-EVALUATION:")
             print(evaluation)
@@ -383,18 +514,22 @@ class ZoraSelfDevelopment:
                 "self_evaluation": evaluation
             }
 
-            if evaluation.get("success"):
+            if evaluation.get("success") is True:
                 success = True
                 final_filename = filename
+                feedback = ""
                 break
 
-            feedback = evaluation.get(
-                "message",
-                "Hasil belum sesuai."
-            )
+            feedback = str(
+                evaluation.get(
+                    "message",
+                    "Hasil belum sesuai."
+                )
+            )[:self.MAX_ERROR_MESSAGE]
 
             self._remove_failed_prototype(filename)
 
+        # Catat hasil akhir, termasuk kegagalan akibat exception.
         state = self.load_state()
 
         state["history"].append({
@@ -406,7 +541,7 @@ class ZoraSelfDevelopment:
             "message": (
                 "Prototype berhasil diverifikasi."
                 if success
-                else feedback
+                else feedback or "Pengembangan gagal."
             )
         })
 
@@ -423,6 +558,10 @@ class ZoraSelfDevelopment:
             "result": final_result,
             "progress": self.evaluate_progress()
         }
+
+    def develop_next(self):
+        with self.lock:
+            return self._develop_next_locked()
 
     def report(self):
         progress = self.evaluate_progress()
