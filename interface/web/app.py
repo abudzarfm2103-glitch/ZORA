@@ -1,11 +1,36 @@
+from collections import OrderedDict
+import secrets
+import threading
 
-from flask import Flask, render_template_string, request, jsonify
+from flask import (
+    Flask,
+    render_template_string,
+    request,
+    jsonify,
+    session
+)
+
 from brain.zora import Zora
+
 
 app = Flask(__name__)
 
-# Membuat satu instance ZORA untuk server web
-zora = Zora()
+# Kunci acak berlaku selama proses server berjalan.
+# Sesi browser akan dibuat ulang setelah server dimulai ulang.
+app.secret_key = secrets.token_hex(32)
+
+app.config.update(
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE="Lax",
+    SESSION_COOKIE_SECURE=False,
+    MAX_CONTENT_LENGTH=64 * 1024
+)
+
+MAX_SESSIONS = 50
+MAX_MESSAGE_LENGTH = 10000
+
+_sessions = OrderedDict()
+_sessions_lock = threading.RLock()
 
 
 HTML = """
@@ -172,6 +197,47 @@ document.getElementById("message").addEventListener(
 """
 
 
+def _close_zora(zora):
+    try:
+        zora.memory.close()
+    except Exception:
+        app.logger.exception("Gagal menutup memori sesi ZORA")
+
+
+def get_zora_for_session():
+    session_id = session.get("zora_session_id")
+
+    if not session_id:
+        session_id = secrets.token_urlsafe(32)
+        session["zora_session_id"] = session_id
+
+    with _sessions_lock:
+
+        record = _sessions.get(session_id)
+
+        if record is not None:
+            _sessions.move_to_end(session_id)
+            return record
+
+        zora = Zora()
+
+        record = {
+            "zora": zora,
+            "lock": threading.RLock()
+        }
+
+        _sessions[session_id] = record
+
+        while len(_sessions) > MAX_SESSIONS:
+            old_id, old_record = _sessions.popitem(last=False)
+
+            if old_id != session_id:
+                with old_record["lock"]:
+                    _close_zora(old_record["zora"])
+
+        return record
+
+
 @app.route("/")
 def home():
     return render_template_string(HTML)
@@ -188,16 +254,28 @@ def chat():
             "error": "Pesan tidak boleh kosong."
         }), 400
 
-    try:
+    message = message.strip()
 
-        jawaban = zora.process_message(message)
+    if len(message) > MAX_MESSAGE_LENGTH:
+        return jsonify({
+            "error": "Pesan terlalu panjang. Maksimal 10.000 karakter."
+        }), 413
+
+    try:
+        record = get_zora_for_session()
+
+        # Satu sesi hanya memproses satu pesan pada satu waktu.
+        with record["lock"]:
+            jawaban = record["zora"].process_message(message)
 
         return jsonify({
             "reply": jawaban
         })
 
     except Exception:
-        app.logger.exception("Terjadi kesalahan saat memproses pesan ZORA")
+        app.logger.exception(
+            "Terjadi kesalahan saat memproses pesan ZORA"
+        )
 
         return jsonify({
             "error": "Maaf, ZORA mengalami kesalahan saat memproses pesan."
@@ -209,5 +287,6 @@ if __name__ == "__main__":
     app.run(
         host="127.0.0.1",
         port=5000,
-        debug=False
+        debug=False,
+        threaded=True
     )

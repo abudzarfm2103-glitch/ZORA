@@ -1,9 +1,11 @@
-
 import json
+import os
+import sys
+import uuid
 from pathlib import Path
 
-
 ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))
 
 
 class ZoraSkillPrioritization:
@@ -12,17 +14,9 @@ class ZoraSkillPrioritization:
 
         self.discovery = discovery
 
-        self.result_file = (
-            ROOT / "data" / "zora_skill_priorities.json"
-        )
-
-        self.history_file = (
-            ROOT / "data" / "zora_autonomous_development_history.json"
-        )
-
-        self.capability_file = (
-            ROOT / "data" / "zora_capability_report.json"
-        )
+        self.result_file = ROOT / "data" / "zora_skill_priorities.json"
+        self.history_file = ROOT / "data" / "zora_autonomous_development_history.json"
+        self.capability_file = ROOT / "data" / "zora_capability_report.json"
 
         self.dependency_map = {
             "language_understanding": [
@@ -51,9 +45,8 @@ class ZoraSkillPrioritization:
 
         try:
             if path.exists():
-                return json.loads(
-                    path.read_text(encoding="utf-8")
-                )
+                data = json.loads(path.read_text(encoding="utf-8"))
+                return data
         except (OSError, json.JSONDecodeError):
             pass
 
@@ -61,15 +54,18 @@ class ZoraSkillPrioritization:
 
     def evaluate_skill(self, skill):
 
-        skill_id = skill["id"]
+        if not isinstance(skill, dict):
+            raise ValueError("Data kemampuan tidak valid.")
 
-        history = self.read_json(
-            self.history_file, []
-        )
+        proposal_id = skill.get("id")
+        skill_id = skill.get("skill_id", proposal_id)
+        skill_name = skill.get("name", skill_id)
 
-        capability_report = self.read_json(
-            self.capability_file, {}
-        )
+        if not isinstance(skill_id, str) or not skill_id:
+            raise ValueError("ID kemampuan tidak valid.")
+
+        history = self.read_json(self.history_file, [])
+        capability_report = self.read_json(self.capability_file, {})
 
         if not isinstance(history, list):
             history = []
@@ -81,15 +77,15 @@ class ZoraSkillPrioritization:
             item for item in history
             if isinstance(item, dict)
             and item.get("skill_id") == skill_id
+            and isinstance(item.get("success"), bool)
         ]
 
-        capability = capability_report.get(
-            skill_id, {}
-        )
+        capability = capability_report.get(skill_id, {})
 
-        status = capability.get(
-            "status", "belum_diuji"
-        )
+        if not isinstance(capability, dict):
+            capability = {}
+
+        status = capability.get("status", skill.get("status", "belum_diuji"))
 
         successful = sum(
             1 for item in records
@@ -106,7 +102,6 @@ class ZoraSkillPrioritization:
             and records[-1].get("success") is False
         )
 
-        # Nilai manfaat berdasarkan jenis kebutuhan.
         usefulness_map = {
             "language_understanding": 10,
             "planning": 10,
@@ -119,48 +114,31 @@ class ZoraSkillPrioritization:
 
         usefulness = usefulness_map.get(skill_id, 7)
 
-        # Tingkat kebutuhan berdasarkan hasil evaluasi.
-        if latest_failed:
+        if latest_failed or status == "perlu_perbaikan":
             importance = 10
-
-        elif status == "perlu_perbaikan":
-            importance = 10
-
         elif status == "belum_diuji":
             importance = 9
-
         elif status == "terverifikasi":
             importance = 3
-
         else:
             importance = 7
 
-        dependencies = self.dependency_map.get(
-            skill_id, []
-        )
+        dependencies = self.dependency_map.get(skill_id, [])
 
         verified_dependencies = sum(
             1 for dependency in dependencies
-            if capability_report.get(
-                dependency, {}
-            ).get("status") == "terverifikasi"
+            if isinstance(capability_report.get(dependency), dict)
+            and capability_report[dependency].get("status") == "terverifikasi"
         )
 
-        if dependencies:
-            dependency_score = (
-                5 + verified_dependencies * 2
-            )
-        else:
-            dependency_score = 5
-
-        dependency_score = min(
-            10, dependency_score
+        dependency_score = (
+            5 + verified_dependencies * 2
+            if dependencies else 5
         )
 
-        # Tambahkan perhatian jika ada kegagalan.
+        dependency_score = min(10, dependency_score)
         failure_score = min(10, failed * 2)
 
-        # Nilai akhir.
         total = (
             usefulness * 0.30
             + importance * 0.35
@@ -169,8 +147,9 @@ class ZoraSkillPrioritization:
         )
 
         return {
-            "id": skill_id,
-            "name": skill["name"],
+            "id": proposal_id,
+            "skill_id": skill_id,
+            "name": skill_name,
             "status": status,
             "scores": {
                 "usefulness": usefulness,
@@ -190,14 +169,57 @@ class ZoraSkillPrioritization:
             "total": round(total, 2)
         }
 
+    def save_result(self, result):
+
+        self.result_file.parent.mkdir(parents=True, exist_ok=True)
+
+        temporary_file = self.result_file.with_name(
+            f".{self.result_file.name}.{uuid.uuid4().hex}.tmp"
+        )
+
+        try:
+            temporary_file.write_text(
+                json.dumps(result, indent=4, ensure_ascii=False),
+                encoding="utf-8"
+            )
+            os.replace(temporary_file, self.result_file)
+
+        finally:
+            try:
+                temporary_file.unlink(missing_ok=True)
+            except OSError:
+                pass
+
     def prioritize(self):
 
-        candidates = self.discovery.discover()
+        discovery_result = self.discovery.discover()
 
-        evaluated = [
-            self.evaluate_skill(skill)
-            for skill in candidates
-        ]
+        if (
+            isinstance(discovery_result, tuple)
+            and len(discovery_result) == 2
+        ):
+            proposals, new_candidates = discovery_result
+        elif isinstance(discovery_result, list):
+            proposals = discovery_result
+            new_candidates = []
+        else:
+            raise ValueError(
+                "Hasil discovery tidak memiliki format yang dikenali."
+            )
+
+        if not isinstance(proposals, list):
+            proposals = []
+
+        if not isinstance(new_candidates, list):
+            new_candidates = []
+
+        evaluated = []
+
+        for skill in proposals:
+            try:
+                evaluated.append(self.evaluate_skill(skill))
+            except (ValueError, TypeError, KeyError) as error:
+                print("Peringatan: kandidat dilewati:", error)
 
         evaluated.sort(
             key=lambda item: (
@@ -206,31 +228,16 @@ class ZoraSkillPrioritization:
             )
         )
 
-        for index, item in enumerate(
-            evaluated, start=1
-        ):
+        for index, item in enumerate(evaluated, start=1):
             item["rank"] = index
 
         result = {
-            "selected_skill": (
-                evaluated[0] if evaluated else None
-            ),
-            "all_priorities": evaluated
+            "selected_skill": evaluated[0] if evaluated else None,
+            "all_priorities": evaluated,
+            "unreviewed_candidates": new_candidates
         }
 
-        self.result_file.parent.mkdir(
-            parents=True,
-            exist_ok=True
-        )
-
-        self.result_file.write_text(
-            json.dumps(
-                result,
-                indent=4,
-                ensure_ascii=False
-            ),
-            encoding="utf-8"
-        )
+        self.save_result(result)
 
         return result
 
@@ -248,6 +255,8 @@ class ZoraSkillPrioritization:
                 f"{item['name']}"
             )
 
+            print("ID usulan:", item["id"])
+            print("ID kemampuan:", item["skill_id"])
             print("Status:", item["status"])
             print("Nilai:", item["total"])
             print("Dasar penilaian:", item["scores"])
@@ -257,22 +266,20 @@ class ZoraSkillPrioritization:
         selected = result["selected_skill"]
 
         if selected:
-
             print("\nKemampuan yang dipilih ZORA:")
             print(selected["name"])
-
         else:
+            print("\nTidak ada kebutuhan pengembangan yang ditemukan.")
 
-            print("\nTidak ada kandidat pengembangan.")
+        print(
+            "\nKandidat kemampuan baru yang belum ditinjau:",
+            len(result["unreviewed_candidates"])
+        )
 
         return result
 
 
 def main():
-
-    import sys
-
-    sys.path.insert(0, str(ROOT))
 
     from brain.zora import Zora
     from developer.self_development import ZoraSelfDevelopment
@@ -282,7 +289,6 @@ def main():
     zora = Zora()
 
     try:
-
         developer = ZoraSelfDevelopment(zora)
         planner = ZoraDevelopmentPlanner(developer)
         discovery = ZoraSkillDiscovery(planner)
@@ -291,7 +297,6 @@ def main():
         prioritization.report()
 
     finally:
-
         zora.memory.close()
 
 

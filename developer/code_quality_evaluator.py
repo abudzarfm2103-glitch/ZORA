@@ -1,4 +1,3 @@
-
 import ast
 import re
 
@@ -8,7 +7,7 @@ class ZoraCodeQualityEvaluator:
     def evaluate(self, code, output, task_id, task=None):
         try:
             tree = ast.parse(code)
-        except (SyntaxError, TypeError):
+        except (SyntaxError, TypeError, ValueError):
             return {
                 "success": False,
                 "message": "Kode memiliki kesalahan sintaks.",
@@ -59,15 +58,11 @@ class ZoraCodeQualityEvaluator:
         return values
 
     def get_source_values(self, task, criteria):
-        """
-        Mengambil nilai sumber dari kriteria atau instruksi tugas.
-        Tidak mengunci angka tertentu.
-        """
-
         parameters = criteria.get("semantic_parameters", {})
 
         if (
-            "nilai_sumber_a" in parameters
+            isinstance(parameters, dict)
+            and "nilai_sumber_a" in parameters
             and "nilai_sumber_b" in parameters
         ):
             return (
@@ -77,22 +72,16 @@ class ZoraCodeQualityEvaluator:
 
         instruction = str(task.get("instruction", ""))
 
-        pattern_a = (
-            r"nilai_sumber_a\s+bernilai\s+"
-            r"(-?\d+(?:\.\d+)?)"
-        )
-
-        pattern_b = (
-            r"nilai_sumber_b\s+bernilai\s+"
-            r"(-?\d+(?:\.\d+)?)"
-        )
-
         match_a = re.search(
-            pattern_a, instruction, re.IGNORECASE
+            r"nilai_sumber_a\s+bernilai\s+(-?\d+(?:\.\d+)?)",
+            instruction,
+            re.IGNORECASE
         )
 
         match_b = re.search(
-            pattern_b, instruction, re.IGNORECASE
+            r"nilai_sumber_b\s+bernilai\s+(-?\d+(?:\.\d+)?)",
+            instruction,
+            re.IGNORECASE
         )
 
         if not match_a or not match_b:
@@ -100,11 +89,7 @@ class ZoraCodeQualityEvaluator:
 
         def convert_number(value):
             number = float(value)
-
-            if number.is_integer():
-                return int(number)
-
-            return number
+            return int(number) if number.is_integer() else number
 
         return (
             convert_number(match_a.group(1)),
@@ -115,7 +100,7 @@ class ZoraCodeQualityEvaluator:
 
         criteria = task.get("evaluation_criteria", {})
 
-        if not criteria:
+        if not isinstance(criteria, dict) or not criteria:
             return {
                 "success": False,
                 "message": "Kriteria evaluasi tidak tersedia.",
@@ -128,10 +113,46 @@ class ZoraCodeQualityEvaluator:
             "required_variables", []
         )
 
+        if not isinstance(required_variables, list):
+            return {
+                "success": False,
+                "message": "Format variabel wajib tidak valid.",
+                "checks": {}
+            }
+
         variable_check = all(
-            name in assignments
+            isinstance(name, str) and name in assignments
             for name in required_variables
         )
+
+        expected_variables = criteria.get(
+            "expected_variables"
+        )
+
+        value_check = True
+
+        if expected_variables is not None:
+
+            if not isinstance(expected_variables, dict) or not expected_variables:
+                value_check = False
+
+            else:
+                for name, expected_value in expected_variables.items():
+
+                    if name not in assignments:
+                        value_check = False
+                        break
+
+                    actual_value = self.constant_value(
+                        assignments[name]
+                    )
+
+                    if (
+                        type(actual_value) is not type(expected_value)
+                        or actual_value != expected_value
+                    ):
+                        value_check = False
+                        break
 
         actual_operations = set()
 
@@ -147,6 +168,9 @@ class ZoraCodeQualityEvaluator:
             "required_operations", []
         )
 
+        if not isinstance(required_operations, list):
+            required_operations = []
+
         operation_check = all(
             operation in actual_operations
             for operation in required_operations
@@ -161,6 +185,9 @@ class ZoraCodeQualityEvaluator:
         required_control_flow = criteria.get(
             "required_control_flow", []
         )
+
+        if not isinstance(required_control_flow, list):
+            required_control_flow = []
 
         control_check = all(
             item in actual_control_flow
@@ -191,6 +218,7 @@ class ZoraCodeQualityEvaluator:
 
         checks = {
             "Variabel wajib tersedia": variable_check,
+            "Nilai variabel sesuai target": value_check,
             "Operasi wajib digunakan": operation_check,
             "Struktur kontrol wajib digunakan": control_check,
             "Penggunaan print": print_check,
@@ -204,19 +232,13 @@ class ZoraCodeQualityEvaluator:
             )
 
             actual_a = (
-                self.constant_value(
-                    assignments["nilai_sumber_a"]
-                )
-                if "nilai_sumber_a" in assignments
-                else None
+                self.constant_value(assignments["nilai_sumber_a"])
+                if "nilai_sumber_a" in assignments else None
             )
 
             actual_b = (
-                self.constant_value(
-                    assignments["nilai_sumber_b"]
-                )
-                if "nilai_sumber_b" in assignments
-                else None
+                self.constant_value(assignments["nilai_sumber_b"])
+                if "nilai_sumber_b" in assignments else None
             )
 
             values_available = (
@@ -258,20 +280,12 @@ class ZoraCodeQualityEvaluator:
                 ):
                     valid_condition = True
 
-                    true_values = self.get_printed_value(
-                        node.body
-                    )
-
-                    false_values = self.get_printed_value(
-                        node.orelse
-                    )
-
                     valid_true_branch = (
-                        "sumber_a" in true_values
+                        "sumber_a" in self.get_printed_value(node.body)
                     )
 
                     valid_false_branch = (
-                        "sumber_b" in false_values
+                        "sumber_b" in self.get_printed_value(node.orelse)
                     )
 
             checks["Perbandingan sumber benar"] = valid_condition
@@ -321,7 +335,6 @@ class ZoraCodeQualityEvaluator:
         }
 
         output_text = str(output).strip()
-
         output_lines = [
             line.strip()
             for line in output_text.splitlines()
@@ -521,108 +534,66 @@ def main():
     evaluator = ZoraCodeQualityEvaluator()
 
     task = {
-        "skill_id": "source_evaluation",
-        "instruction": (
-            "Buat nilai_sumber_a bernilai 8 dan "
-            "nilai_sumber_b bernilai 5. "
-            "Bandingkan kedua nilai menggunakan if/else."
-        ),
+        "skill_id": "problem_solving",
+        "instruction": "Hitung total dibagi kelompok.",
+        "expected_output": "5.0",
         "evaluation_criteria": {
-            "required_variables": [
-                "nilai_sumber_a",
-                "nilai_sumber_b"
-            ],
-            "required_operations": ["Gt"],
-            "required_control_flow": ["If"],
-            "expected_output": "sumber_a",
+            "required_variables": ["total", "kelompok"],
+            "expected_variables": {
+                "total": 20,
+                "kelompok": 4
+            },
+            "required_operations": ["Div"],
+            "required_control_flow": [],
+            "expected_output": "5.0",
             "require_print": True
         }
     }
 
     tests = [
         (
-            "Variasi nilai 8 dan 5",
-            "nilai_sumber_a = 8\n"
-            "nilai_sumber_b = 5\n"
-            "if nilai_sumber_a > nilai_sumber_b:\n"
-            "    print('sumber_a')\n"
-            "else:\n"
-            "    print('sumber_b')",
-            "sumber_a",
+            "Nilai dan hasil benar",
+            "total = 20\nkelompok = 4\nhasil = total / kelompok\nprint(hasil)",
+            "5.0",
             True
         ),
         (
-            "Nilai sumber salah",
-            "nilai_sumber_a = 1\n"
-            "nilai_sumber_b = 0\n"
-            "if nilai_sumber_a > nilai_sumber_b:\n"
-            "    print('sumber_a')\n"
-            "else:\n"
-            "    print('sumber_b')",
-            "sumber_a",
+            "Nilai variabel salah",
+            "total = 10\nkelompok = 2\nhasil = total / kelompok\nprint(hasil)",
+            "5.0",
             False
         ),
         (
-            "Percabangan salah",
-            "nilai_sumber_a = 8\n"
-            "nilai_sumber_b = 5\n"
-            "if nilai_sumber_a > nilai_sumber_b:\n"
-            "    print('sumber_b')\n"
-            "else:\n"
-            "    print('sumber_a')",
-            "sumber_a",
+            "Output salah",
+            "total = 20\nkelompok = 4\nhasil = total / kelompok\nprint(hasil)",
+            "10",
             False
         ),
         (
-            "Nilai terbalik",
-            "nilai_sumber_a = 3\n"
-            "nilai_sumber_b = 9\n"
-            "if nilai_sumber_a > nilai_sumber_b:\n"
-            "    print('sumber_a')\n"
-            "else:\n"
-            "    print('sumber_b')",
-            "sumber_b",
+            "Variabel wajib hilang",
+            "total = 20\nhasil = total / 4\nprint(hasil)",
+            "5.0",
             False
         )
     ]
 
-    print("\nZORA SEMANTIC EVALUATOR TEST")
-    print("============================")
+    print("\nZORA CODE QUALITY EVALUATOR TEST")
+    print("--------------------------------")
 
     for name, code, output, expected in tests:
-        test_task = dict(task)
-
-        if name == "Nilai terbalik":
-            test_task["instruction"] = (
-                "Buat nilai_sumber_a bernilai 3 dan "
-                "nilai_sumber_b bernilai 9."
-            )
-            test_task["evaluation_criteria"] = dict(
-                task["evaluation_criteria"]
-            )
-            test_task["evaluation_criteria"]["expected_output"] = (
-                "sumber_b"
-            )
 
         result = evaluator.evaluate(
             code,
             output,
-            "source_evaluation",
-            task=test_task
+            "problem_solving",
+            task=task
         )
 
         passed = result["success"] == expected
 
         print(
-            name, ":",
-            "LULUS" if passed else "GAGAL"
+            f"{'LULUS' if passed else 'GAGAL'}: {name}"
         )
-
-        for check, status in result["checks"].items():
-            print(
-                " -", check, ":",
-                "LULUS" if status else "GAGAL"
-            )
 
     print("\nSELESAI")
 

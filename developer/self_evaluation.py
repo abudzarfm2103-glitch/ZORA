@@ -3,185 +3,298 @@ import ast
 
 class ZoraSelfEvaluation:
 
+    @staticmethod
+    def _parse(code):
+        if not isinstance(code, str) or len(code) > 65536:
+            return None
+        try:
+            return ast.parse(code)
+        except (SyntaxError, ValueError, TypeError, RecursionError):
+            return None
+
+    @staticmethod
+    def _assignments(tree):
+        result = {}
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Assign):
+                for target in node.targets:
+                    if isinstance(target, ast.Name):
+                        result[target.id] = node.value
+        return result
+
+    def _static_value(self, node, assignments):
+        if isinstance(node, ast.Constant):
+            if type(node.value) in (int, float):
+                return node.value
+
+        if isinstance(node, ast.Name):
+            value = assignments.get(node.id)
+            if isinstance(value, ast.Constant):
+                if type(value.value) in (int, float):
+                    return value.value
+
+        return None
+
+    def _has_comparison_values(self, tree, assignments, expected):
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Compare):
+                continue
+
+            if len(node.ops) != 1:
+                continue
+
+            left = self._static_value(node.left, assignments)
+            right = self._static_value(node.comparators[0], assignments)
+
+            if {left, right} == set(expected):
+                return True
+
+        return False
+
+    @staticmethod
+    def _has_operator(node, operator):
+        return any(
+            isinstance(item, ast.BinOp)
+            and isinstance(item.op, operator)
+            for item in ast.walk(node)
+        )
+
+    @staticmethod
+    def _uses_names(node, names):
+        used = {
+            item.id for item in ast.walk(node)
+            if isinstance(item, ast.Name)
+        }
+        return set(names).issubset(used)
+
+    @staticmethod
+    def _has_if(tree):
+        return any(isinstance(node, ast.If) for node in ast.walk(tree))
+
+    @staticmethod
+    def _result(success, message):
+        return {"success": success, "message": message}
+
     def evaluate(self, task_id, code, output):
 
-        try:
-            tree = ast.parse(code)
-        except SyntaxError:
-            return {
-                "success": False,
-                "message": "Kode memiliki kesalahan sintaks."
-            }
+        tree = self._parse(code)
 
-        nodes = list(ast.walk(tree))
+        if tree is None:
+            return self._result(
+                False,
+                "Kode memiliki kesalahan sintaks atau ukuran tidak valid."
+            )
 
-        operators = {
-            type(node.op)
-            for node in nodes
-            if isinstance(node, ast.BinOp)
-        }
+        if not isinstance(output, str):
+            output = str(output)
 
-        has_if = any(
-            isinstance(node, ast.If)
-            for node in nodes
-        )
-
-        has_comparison = any(
-            isinstance(node, ast.Compare)
-            for node in nodes
-        )
-
-        actual_output = str(output).strip()
+        actual_output = output.strip()
+        assignments = self._assignments(tree)
 
         if task_id == "logical_reasoning":
 
-            valid_structure = has_if and has_comparison
-            valid_output = actual_output == "20"
+            valid_values = (
+                assignments.get("a") is not None
+                and assignments.get("b") is not None
+                and self._static_value(
+                    assignments["a"], assignments
+                ) == 10
+                and self._static_value(
+                    assignments["b"], assignments
+                ) == 20
+            )
 
-            if valid_structure and valid_output:
-                return {
-                    "success": True,
-                    "message": "Penalaran logis berhasil diverifikasi."
-                }
+            if not valid_values:
+                valid_values = self._has_comparison_values(
+                    tree, assignments, (10, 20)
+                )
 
-            return {
-                "success": False,
-                "message": "Gunakan if dan perbandingan. Output harus tepat 20."
-            }
+            valid = (
+                valid_values
+                and self._has_comparison_values(
+                    tree, assignments, (10, 20)
+                )
+                and self._has_if(tree)
+                and actual_output == "20"
+            )
+
+            return self._result(
+                valid,
+                "Penalaran logis berhasil diverifikasi."
+                if valid else
+                "Gunakan perbandingan angka 10 dan 20 dengan if. "
+                "Output harus tepat 20."
+            )
 
         if task_id == "calculation":
 
-            required = {
-                ast.Add,
-                ast.Sub,
-                ast.Mult,
-                ast.Div
-            }
+            valid_values = (
+                self._static_value(
+                    assignments.get("a"), assignments
+                ) == 10
+                and self._static_value(
+                    assignments.get("b"), assignments
+                ) == 20
+            )
+
+            operators = (
+                ast.Add, ast.Sub, ast.Mult, ast.Div
+            )
+
+            valid_operations = all(
+                self._has_operator(tree, op)
+                for op in operators
+            )
 
             expected = ["30", "-10", "200", "0.5"]
-
             actual = [
                 line.strip()
                 for line in actual_output.splitlines()
                 if line.strip()
             ]
 
-            if required.issubset(operators) and actual == expected:
-                return {
-                    "success": True,
-                    "message": "Operasi matematika berhasil diverifikasi."
-                }
+            valid = (
+                valid_values
+                and valid_operations
+                and actual == expected
+            )
 
-            return {
-                "success": False,
-                "message": "Operasi dan empat output perhitungan belum sesuai."
-            }
+            return self._result(
+                valid,
+                "Operasi matematika berhasil diverifikasi."
+                if valid else
+                "Pastikan a=10, b=20 dan empat hasil operasi benar."
+            )
 
         if task_id == "condition_analysis":
 
-            has_ten = any(
-                isinstance(node, ast.Constant)
-                and node.value == 10
-                for node in nodes
+            valid_number = (
+                self._static_value(
+                    assignments.get("angka"), assignments
+                ) == 10
             )
 
-            if (
-                has_if
-                and has_comparison
-                and has_ten
-                and actual_output == "positif"
-            ):
-                return {
-                    "success": True,
-                    "message": "Analisis kondisi berhasil diverifikasi."
-                }
+            valid_comparison = self._has_comparison_values(
+                tree, assignments, (0, 10)
+            )
 
-            return {
-                "success": False,
-                "message": "Periksa angka 10 dengan if. Output harus tepat positif."
-            }
+            valid = (
+                valid_number
+                and valid_comparison
+                and self._has_if(tree)
+                and actual_output == "positif"
+            )
+
+            return self._result(
+                valid,
+                "Analisis kondisi berhasil diverifikasi."
+                if valid else
+                "Gunakan angka=10, bandingkan dengan 0 menggunakan "
+                "if, dan tampilkan positif."
+            )
 
         if task_id == "data_analysis":
 
-            assigned_names = {
-                node.id
-                for item in nodes
-                if isinstance(item, ast.Assign)
-                for target in item.targets
-                for node in ast.walk(target)
-                if isinstance(node, ast.Name)
+            expected_values = {
+                "pagi": 10,
+                "siang": 20,
+                "sore": 30
             }
 
-            required_names = {
-                "pagi",
-                "siang",
-                "sore",
-                "total",
-                "rata_rata"
-            }
-
-            required_operators = {
-                ast.Add,
-                ast.Div
-            }
-
-            valid_structure = (
-                required_names.issubset(assigned_names)
-                and required_operators.issubset(operators)
-                and has_if
-                and has_comparison
+            valid_values = all(
+                self._static_value(
+                    assignments.get(name), assignments
+                ) == value
+                for name, value in expected_values.items()
             )
 
-            valid_output = actual_output == "target tercapai"
+            total_node = assignments.get("total")
+            average_node = assignments.get("rata_rata")
 
-            if valid_structure and valid_output:
-                return {
-                    "success": True,
-                    "message": "Analisis data berhasil diverifikasi."
-                }
-
-            return {
-                "success": False,
-                "message": (
-                    "Gunakan variabel pagi, siang, sore, total, "
-                    "dan rata_rata. Hitung total dan rata-rata "
-                    "dengan penjumlahan serta pembagian. "
-                    "Gunakan if dan perbandingan. "
-                    "Output harus tepat: target tercapai."
+            valid_total = (
+                total_node is not None
+                and self._uses_names(
+                    total_node, ("pagi", "siang", "sore")
                 )
-            }
+                and self._has_operator(total_node, ast.Add)
+            )
 
-        return {
-            "success": False,
-            "message": "Jenis tugas belum memiliki aturan evaluasi."
-        }
+            valid_average = (
+                average_node is not None
+                and self._uses_names(average_node, ("total",))
+                and self._has_operator(average_node, ast.Div)
+                and any(
+                    isinstance(item, ast.Constant)
+                    and item.value == 3
+                    for item in ast.walk(average_node)
+                )
+            )
+
+            valid_condition = False
+
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.If):
+                    continue
+
+                if self._uses_names(node.test, ("rata_rata",)):
+                    if self._has_comparison_values(
+                        ast.Expression(node.test),
+                        assignments,
+                        (20, 20)
+                    ):
+                        valid_condition = True
+                        break
+
+            # Perbandingan rata-rata minimal 20.
+            if not valid_condition:
+                for node in ast.walk(tree):
+                    if not isinstance(node, ast.If):
+                        continue
+                    for comparison in ast.walk(node.test):
+                        if not isinstance(comparison, ast.Compare):
+                            continue
+                        if (
+                            self._uses_names(
+                                comparison, ("rata_rata",)
+                            )
+                            and any(
+                                isinstance(item, ast.Constant)
+                                and item.value == 20
+                                for item in ast.walk(comparison)
+                            )
+                        ):
+                            valid_condition = True
+                            break
+
+            valid = (
+                valid_values
+                and valid_total
+                and valid_average
+                and valid_condition
+                and self._has_if(tree)
+                and actual_output == "target tercapai"
+            )
+
+            return self._result(
+                valid,
+                "Analisis data berhasil diverifikasi."
+                if valid else
+                "Periksa nilai data, total, rata-rata, dan kondisi minimal 20."
+            )
+
+        return self._result(
+            False,
+            "Jenis tugas belum memiliki aturan evaluasi."
+        )
 
 
 def main():
-
     evaluator = ZoraSelfEvaluation()
-
-    print("PENGUJIAN SELF-EVALUATION ENGINE")
-
-    kode_salah = """
-angka = 10
-
-if angka > 0:
-    print("Teks positif")
-"""
-
-    hasil = evaluator.evaluate(
+    print(evaluator.evaluate(
         "condition_analysis",
-        kode_salah,
-        "Teks positif"
-    )
-
-    print(hasil)
-
-    if hasil["success"]:
-        print("PENGUJIAN GAGAL")
-    else:
-        print("PENGUJIAN BERHASIL: output yang salah ditolak.")
+        'angka = 10\nif angka > 0:\n    print("positif")',
+        "positif"
+    ))
 
 
 if __name__ == "__main__":

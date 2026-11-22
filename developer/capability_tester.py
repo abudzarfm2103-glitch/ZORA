@@ -1,5 +1,7 @@
-import sys
 import json
+import os
+import sys
+import uuid
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -37,32 +39,117 @@ class ZoraCapabilityTester:
         )
     }
 
+    SECURITY_TESTS = {
+        "large_integer": (
+            "angka = " + ("9" * 500) + "\nprint(angka)"
+        ),
+        "large_string": (
+            "teks = 'A' * 20000\nprint(teks)"
+        ),
+        "import_denied": (
+            "import os\nprint('tidak boleh berjalan')"
+        ),
+        "file_access_denied": (
+            "isi = open('/etc/passwd')\nprint(isi)"
+        ),
+        "infinite_loop": (
+            "angka = 1\nwhile angka > 0:\n    angka = angka + 1"
+        )
+    }
+
     def __init__(self, zora):
         self.zora = zora
         self.registry = ZoraCapabilityRegistry()
 
+    def run_one_test(self, code):
+        folder = "developer_sandbox/pengujian"
+        filename = (
+            f"{folder}/capability_test_{uuid.uuid4().hex}.py"
+        )
+
+        target = None
+
+        try:
+            target = self.zora.execution.validate_path(filename)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(code, encoding="utf-8")
+
+            return self.zora.execution.test_code(filename)
+
+        finally:
+            if target is not None:
+                try:
+                    target.unlink(missing_ok=True)
+                except OSError as error:
+                    print(
+                        "Peringatan: file pengujian sementara "
+                        "tidak dapat dihapus:",
+                        error
+                    )
+
+    def save_results(self, results):
+        state_file = self.registry.state_file
+        temporary_file = state_file.with_name(
+            f".{state_file.name}.{uuid.uuid4().hex}.tmp"
+        )
+
+        try:
+            if state_file.exists():
+                state = json.loads(
+                    state_file.read_text(encoding="utf-8")
+                )
+                if not isinstance(state, dict):
+                    raise ValueError(
+                        "Format data kemampuan tidak valid."
+                    )
+            else:
+                state = {}
+
+            for name in self.TESTS:
+                state[name] = {
+                    "verified": results.get(name, {}).get(
+                        "verified", False
+                    )
+                }
+
+            state_file.parent.mkdir(parents=True, exist_ok=True)
+            temporary_file.write_text(
+                json.dumps(
+                    state,
+                    indent=4,
+                    ensure_ascii=False
+                ),
+                encoding="utf-8"
+            )
+            os.replace(temporary_file, state_file)
+
+            return True
+
+        except (OSError, ValueError, TypeError) as error:
+            print("Peringatan: hasil belum tersimpan:", error)
+            return False
+
+        finally:
+            try:
+                temporary_file.unlink(missing_ok=True)
+            except OSError:
+                pass
+
     def run(self):
         results = {}
-        folder = "developer_sandbox/pengujian"
 
         for name, (code, expected) in self.TESTS.items():
-            filename = f"{folder}/capability_test_{name}.py"
-
             try:
-                target = self.zora.execution.validate_path(filename)
-                target.parent.mkdir(parents=True, exist_ok=True)
-                target.write_text(code, encoding="utf-8")
-
-                result = self.zora.execution.test_code(filename)
+                result = self.run_one_test(code)
                 actual = result.get("output", "").strip()
 
-                success = (
+                verified = (
                     result.get("success") is True
                     and actual == expected
                 )
 
                 results[name] = {
-                    "verified": success,
+                    "verified": verified,
                     "expected": expected,
                     "actual": actual,
                     "message": result.get("message")
@@ -74,59 +161,26 @@ class ZoraCapabilityTester:
                     "message": str(error)
                 }
 
-        safety_filename = f"{folder}/capability_test_loop_safety.py"
+        for name, code in self.SECURITY_TESTS.items():
+            try:
+                result = self.run_one_test(code)
 
-        try:
-            target = self.zora.execution.validate_path(safety_filename)
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_text(
-                "angka = 1\nwhile angka > 0:\n    angka = angka + 1",
-                encoding="utf-8"
-            )
+                verified = result.get("success") is False
 
-            safety_result = self.zora.execution.test_code(safety_filename)
-
-            safety_verified = (
-                safety_result.get("success") is False
-                and "Batas iterasi while terlampaui."
-                in safety_result.get("message", "")
-            )
-
-            results["loop_safety"] = {
-                "verified": safety_verified,
-                "message": safety_result.get("message")
-            }
-
-        except Exception as error:
-            results["loop_safety"] = {
-                "verified": False,
-                "message": str(error)
-            }
-
-        state_file = self.registry.state_file
-
-        try:
-            if state_file.exists():
-                state = json.loads(
-                    state_file.read_text(encoding="utf-8")
-                )
-            else:
-                state = {}
-
-            for name in self.TESTS:
-                state[name] = {
-                    "verified": results[name]["verified"]
+                results[name] = {
+                    "verified": verified,
+                    "message": result.get("message"),
+                    "rejected": verified
                 }
 
-            state_file.parent.mkdir(parents=True, exist_ok=True)
-            state_file.write_text(
-                json.dumps(state, indent=4, ensure_ascii=False),
-                encoding="utf-8"
-            )
+            except Exception as error:
+                results[name] = {
+                    "verified": False,
+                    "message": str(error),
+                    "rejected": False
+                }
 
-        except (OSError, ValueError) as error:
-            print("Peringatan: hasil belum tersimpan:", error)
-
+        self.save_results(results)
         return results
 
 
@@ -137,12 +191,23 @@ if __name__ == "__main__":
 
     try:
         tester = ZoraCapabilityTester(zora)
-        print("=== HASIL PENGUJIAN KEMAMPUAN ===")
+
+        print("=== HASIL PENGUJIAN KEMAMPUAN DAN KEAMANAN ===")
+        results = tester.run()
+
         print(json.dumps(
-            tester.run(),
+            results,
             indent=4,
             ensure_ascii=False
         ))
+
+        total = len(results)
+        passed = sum(
+            1 for item in results.values()
+            if item.get("verified") is True
+        )
+
+        print(f"\nHASIL: {passed}/{total} pengujian lulus")
 
         print("\n=== INVENTARIS KEMAMPUAN ===")
         print(json.dumps(

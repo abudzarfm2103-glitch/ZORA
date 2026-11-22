@@ -1,8 +1,10 @@
-import sys
+import json
+import os
+import tempfile
+import threading
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(ROOT))
 
 from developer.self_repair import ZoraSelfRepair
 from developer.self_evaluation import ZoraSelfEvaluation
@@ -10,11 +12,23 @@ from developer.self_evaluation import ZoraSelfEvaluation
 
 class ZoraSelfDevelopment:
 
-    def __init__(self, zora):
+    MAX_ATTEMPTS = 3
+    MAX_HISTORY = 5000
+    MAX_STATE_SIZE = 5 * 1024 * 1024
+    MAX_FILENAME_ATTEMPTS = 10000
+
+    def __init__(self, zora, state_file=None):
         self.zora = zora
-        self.repair = ZoraSelfRepair(zora, max_attempts=3)
+        self.repair = ZoraSelfRepair(zora, max_attempts=self.MAX_ATTEMPTS)
         self.evaluator = ZoraSelfEvaluation()
-        self.state_file = ROOT / "data" / "zora_self_development.json"
+
+        self.state_file = (
+            Path(state_file)
+            if state_file is not None
+            else ROOT / "data" / "zora_self_development.json"
+        )
+
+        self.lock = threading.RLock()
 
         self.roadmap = [
             {
@@ -66,52 +80,124 @@ class ZoraSelfDevelopment:
             }
         ]
 
+        self.task_map = {
+            task["id"]: task
+            for task in self.roadmap
+        }
+
+    def _empty_state(self):
+        return {
+            "completed_prototypes": [],
+            "history": []
+        }
+
+    def _validate_state(self, data):
+        if not isinstance(data, dict):
+            raise ValueError("Format data pengembangan tidak valid.")
+
+        completed = data.get("completed_prototypes", [])
+        history = data.get("history", [])
+
+        if not isinstance(completed, list):
+            raise ValueError("Daftar prototype selesai tidak valid.")
+
+        if not isinstance(history, list):
+            raise ValueError("Riwayat pengembangan tidak valid.")
+
+        if len(history) > self.MAX_HISTORY:
+            raise ValueError("Riwayat pengembangan melewati batas.")
+
+        valid_ids = set(self.task_map)
+
+        for item in completed:
+            if not isinstance(item, str) or item not in valid_ids:
+                raise ValueError("ID prototype dalam progres tidak valid.")
+
+        for item in history:
+            if not isinstance(item, dict):
+                raise ValueError("Format catatan riwayat tidak valid.")
+
+        return {
+            "completed_prototypes": list(dict.fromkeys(completed)),
+            "history": history
+        }
+
     def load_state(self):
-        import json
+        with self.lock:
+            if not self.state_file.exists():
+                return self._empty_state()
 
-        if not self.state_file.exists():
-            return {
-                "completed_prototypes": [],
-                "history": []
-            }
+            try:
+                size = self.state_file.stat().st_size
 
-        try:
-            data = json.loads(
-                self.state_file.read_text(encoding="utf-8")
-            )
+                if size > self.MAX_STATE_SIZE:
+                    raise ValueError(
+                        "File progres pengembangan terlalu besar."
+                    )
 
-            if not isinstance(data, dict):
-                raise ValueError("Format tidak valid.")
+                raw = self.state_file.read_text(encoding="utf-8")
+                data = json.loads(raw)
 
-            data.setdefault("completed_prototypes", [])
-            data.setdefault("history", [])
-            return data
+                return self._validate_state(data)
 
-        except (ValueError, OSError):
-            return {
-                "completed_prototypes": [],
-                "history": []
-            }
+            except json.JSONDecodeError as error:
+                raise ValueError(
+                    "File progres pengembangan rusak. "
+                    "Data tidak akan direset atau ditimpa."
+                ) from error
+
+            except OSError as error:
+                raise RuntimeError(
+                    f"Progres pengembangan tidak dapat dibaca: {error}"
+                ) from error
 
     def save_state(self, state):
-        import json
+        validated = self._validate_state(state)
 
-        self.state_file.parent.mkdir(
-            parents=True,
-            exist_ok=True
+        serialized = json.dumps(
+            validated,
+            indent=4,
+            ensure_ascii=False
         )
 
-        self.state_file.write_text(
-            json.dumps(
-                state,
-                indent=4,
-                ensure_ascii=False
-            ),
-            encoding="utf-8"
-        )
+        encoded = serialized.encode("utf-8")
+
+        if len(encoded) > self.MAX_STATE_SIZE:
+            raise ValueError(
+                "Ukuran progres pengembangan melewati batas."
+            )
+
+        if not self.state_file.parent.exists():
+            self.state_file.parent.mkdir(
+                parents=True,
+                exist_ok=True
+            )
+
+        temporary_path = None
+
+        with self.lock:
+            try:
+                descriptor, temporary_name = tempfile.mkstemp(
+                    prefix=".zora_self_development_",
+                    suffix=".tmp",
+                    dir=str(self.state_file.parent)
+                )
+
+                temporary_path = Path(temporary_name)
+
+                with os.fdopen(descriptor, "w", encoding="utf-8") as file:
+                    file.write(serialized)
+                    file.flush()
+                    os.fsync(file.fileno())
+
+                os.replace(temporary_path, self.state_file)
+
+            except OSError:
+                if temporary_path and temporary_path.exists():
+                    temporary_path.unlink()
+                raise
 
     def verify_previous_progress(self):
-
         state = self.load_state()
         verified = []
 
@@ -129,18 +215,26 @@ class ZoraSelfDevelopment:
 
                 filename = record.get("filename")
 
-                if not filename:
+                if not isinstance(filename, str) or not filename:
                     continue
 
                 try:
-                    target = self.zora.execution.validate_path(
-                        filename
-                    )
+                    target = self.zora.execution.validate_path(filename)
 
                     if not target.is_file():
                         continue
 
+                    max_size = getattr(
+                        self.zora.execution.sandbox,
+                        "MAX_FILE_SIZE",
+                        65536
+                    )
+
+                    if target.stat().st_size > max_size:
+                        continue
+
                     code = target.read_text(encoding="utf-8")
+
                     execution = self.zora.execution.test_code(filename)
 
                     if not execution.get("success"):
@@ -157,7 +251,12 @@ class ZoraSelfDevelopment:
                         print("Terverifikasi:", task["name"])
                         break
 
-                except (OSError, ValueError, PermissionError):
+                except (
+                    OSError,
+                    ValueError,
+                    PermissionError,
+                    TypeError
+                ):
                     continue
 
         state["completed_prototypes"] = verified
@@ -166,7 +265,6 @@ class ZoraSelfDevelopment:
         return state
 
     def evaluate_progress(self):
-
         state = self.verify_previous_progress()
 
         remaining = [
@@ -180,6 +278,34 @@ class ZoraSelfDevelopment:
             "next_task": remaining[0] if remaining else None
         }
 
+    def _next_filename(self, task):
+        folder = "developer_sandbox/pengujian"
+
+        for nomor in range(1, self.MAX_FILENAME_ATTEMPTS + 1):
+            filename = (
+                f"{folder}/self_development_"
+                f"{task['id']}_{nomor}.py"
+            )
+
+            target = self.zora.execution.validate_path(filename)
+
+            if not target.exists():
+                return filename
+
+        raise RuntimeError(
+            "Batas pencarian nama file prototype tercapai."
+        )
+
+    def _remove_failed_prototype(self, filename):
+        try:
+            target = self.zora.execution.validate_path(filename)
+
+            if target.is_file():
+                target.unlink()
+
+        except (OSError, ValueError, PermissionError):
+            pass
+
     def develop_next(self):
 
         progress = self.evaluate_progress()
@@ -188,36 +314,30 @@ class ZoraSelfDevelopment:
         if task is None:
             return {
                 "success": True,
-                "message": "Seluruh prototype roadmap berhasil diverifikasi."
+                "message": (
+                    "Seluruh prototype roadmap berhasil diverifikasi."
+                )
             }
 
         print("Kebutuhan berikutnya:", task["name"])
 
-        folder = "developer_sandbox/pengujian"
         state = self.load_state()
+
         final_result = None
         final_filename = None
         success = False
         feedback = ""
+        attempts_used = 0
 
-        for attempt in range(1, 4):
+        for attempt in range(1, self.MAX_ATTEMPTS + 1):
 
-            nomor = 1
+            attempts_used = attempt
 
-            while True:
-                filename = (
-                    f"{folder}/self_development_"
-                    f"{task['id']}_{nomor}.py"
-                )
-
-                target = self.zora.execution.validate_path(filename)
-
-                if not target.exists():
-                    break
-
-                nomor += 1
-
-            final_filename = filename
+            try:
+                filename = self._next_filename(task)
+            except (OSError, ValueError, RuntimeError) as error:
+                feedback = str(error)
+                break
 
             print(f"\nPengembangan tujuan ke-{attempt}...")
             print("File prototype:", filename)
@@ -237,13 +357,16 @@ class ZoraSelfDevelopment:
                 filename=filename
             )
 
+            final_result = result
+
             if not result.get("success"):
                 feedback = result.get(
                     "message",
                     "Prototype gagal melewati Sandbox."
                 )
+
+                self._remove_failed_prototype(filename)
                 print("Sandbox:", feedback)
-                final_result = result
                 continue
 
             evaluation = self.evaluator.evaluate(
@@ -262,6 +385,7 @@ class ZoraSelfDevelopment:
 
             if evaluation.get("success"):
                 success = True
+                final_filename = filename
                 break
 
             feedback = evaluation.get(
@@ -269,10 +393,16 @@ class ZoraSelfDevelopment:
                 "Hasil belum sesuai."
             )
 
+            self._remove_failed_prototype(filename)
+
+        state = self.load_state()
+
         state["history"].append({
             "task": task["name"],
+            "task_id": task["id"],
             "filename": final_filename,
             "success": success,
+            "attempts": attempts_used,
             "message": (
                 "Prototype berhasil diverifikasi."
                 if success
@@ -280,9 +410,10 @@ class ZoraSelfDevelopment:
             )
         })
 
-        if success:
-            if task["id"] not in state["completed_prototypes"]:
-                state["completed_prototypes"].append(task["id"])
+        state["history"] = state["history"][-self.MAX_HISTORY:]
+
+        if success and task["id"] not in state["completed_prototypes"]:
+            state["completed_prototypes"].append(task["id"])
 
         self.save_state(state)
 
@@ -294,7 +425,6 @@ class ZoraSelfDevelopment:
         }
 
     def report(self):
-
         progress = self.evaluate_progress()
 
         return {
@@ -310,7 +440,6 @@ class ZoraSelfDevelopment:
 
 
 def main():
-
     from brain.zora import Zora
 
     zora = Zora()

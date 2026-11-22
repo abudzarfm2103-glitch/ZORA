@@ -1,11 +1,3 @@
-
-import sys
-from pathlib import Path
-
-ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(ROOT))
-
-from brain.zora import Zora
 from developer.self_development import ZoraSelfDevelopment
 
 
@@ -17,22 +9,22 @@ class ZoraDevelopmentPlanner:
     def inspect_capabilities(self):
 
         state = self.developer.verify_previous_progress()
-        completed = state["completed_prototypes"]
 
+        completed = set(state["completed_prototypes"])
         capabilities = []
 
         for task in self.developer.roadmap:
 
-            status = (
-                "terverifikasi"
-                if task["id"] in completed
-                else "belum dikuasai"
-            )
+            verified = task["id"] in completed
 
             capabilities.append({
                 "id": task["id"],
                 "name": task["name"],
-                "status": status
+                "status": (
+                    "terverifikasi"
+                    if verified
+                    else "belum dikuasai"
+                )
             })
 
         return capabilities
@@ -40,7 +32,8 @@ class ZoraDevelopmentPlanner:
     def identify_gaps(self, capabilities):
 
         return [
-            item for item in capabilities
+            item.copy()
+            for item in capabilities
             if item["status"] != "terverifikasi"
         ]
 
@@ -49,19 +42,26 @@ class ZoraDevelopmentPlanner:
         capabilities = self.inspect_capabilities()
         gaps = self.identify_gaps(capabilities)
 
-        progress = self.developer.evaluate_progress()
-
-        next_task = progress["next_task"]
-
-        if next_task:
-            priority = next_task["name"]
-        else:
-            priority = "Kemampuan analisis data"
+        next_task = next(
+            (
+                task for task in self.developer.roadmap
+                if any(
+                    gap["id"] == task["id"]
+                    for gap in gaps
+                )
+            ),
+            None
+        )
 
         return {
             "kemampuan": capabilities,
             "kekurangan": gaps,
-            "prioritas_berikutnya": priority
+            "prioritas_berikutnya": (
+                next_task["name"]
+                if next_task
+                else None
+            ),
+            "seluruh_roadmap_selesai": not bool(gaps)
         }
 
     def report(self):
@@ -82,15 +82,21 @@ class ZoraDevelopmentPlanner:
             for item in plan["kekurangan"]:
                 print("-", item["name"])
         else:
-            print("- Belum ditemukan.")
+            print("- Tidak ada.")
 
         print("\nPrioritas pengembangan berikutnya:")
-        print(plan["prioritas_berikutnya"])
+
+        if plan["prioritas_berikutnya"]:
+            print(plan["prioritas_berikutnya"])
+        else:
+            print("Seluruh roadmap telah selesai.")
 
         return plan
 
 
 def main():
+
+    from brain.zora import Zora
 
     zora = Zora()
 

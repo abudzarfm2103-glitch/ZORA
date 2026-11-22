@@ -1,4 +1,5 @@
-
+import os
+import tempfile
 from pathlib import Path
 
 from developer.sandbox_runner import ZoraSandboxRunner
@@ -15,13 +16,16 @@ class ZoraExecutionEngine:
         "uji_kode"
     ]
 
-    def __init__(self):
+    MAX_READ_SIZE = 1_000_000
+    MAX_WRITE_SIZE = 1_000_000
+    MAX_LIST_ITEMS = 500
 
+    def __init__(self):
         self.project_root = Path(__file__).resolve().parent.parent
 
         self.workspace = (
             self.project_root / "data" / "zora_workspace"
-        )
+        ).resolve()
 
         self.workspace.mkdir(parents=True, exist_ok=True)
 
@@ -30,16 +34,54 @@ class ZoraExecutionEngine:
     def validate_path(self, name):
 
         if not isinstance(name, str) or not name.strip():
-            raise ValueError("Nama file atau folder tidak valid.")
-
-        target = (self.workspace / name).resolve()
-
-        if not target.is_relative_to(self.workspace.resolve()):
-            raise PermissionError(
-                "Akses ditolak. Lokasi berada di luar ruang kerja ZORA."
+            raise ValueError(
+                "Nama file atau folder tidak valid."
             )
 
-        return target
+        try:
+            relative = Path(name)
+
+            if relative.is_absolute():
+                raise PermissionError(
+                    "Akses ke lokasi absolut tidak diizinkan."
+                )
+
+            if ".." in relative.parts:
+                raise PermissionError(
+                    "Akses ke folder di luar ruang kerja ditolak."
+                )
+
+            candidate = self.workspace / relative
+
+            current = self.workspace
+
+            for part in relative.parts:
+                if part in ("", "."):
+                    continue
+
+                current = current / part
+
+                if current.is_symlink():
+                    raise PermissionError(
+                        "Akses melalui symbolic link tidak diizinkan."
+                    )
+
+            target = candidate.resolve()
+
+            if not target.is_relative_to(self.workspace):
+                raise PermissionError(
+                    "Akses ditolak. Lokasi berada di luar ruang kerja ZORA."
+                )
+
+            return target
+
+        except (OSError, ValueError) as error:
+            if isinstance(error, PermissionError):
+                raise
+
+            raise ValueError(
+                "Lokasi file atau folder tidak valid."
+            ) from error
 
     def create_folder(self, name):
 
@@ -74,21 +116,39 @@ class ZoraExecutionEngine:
                 "message": "Lokasi tersebut bukan folder."
             }
 
+        entries = []
+
+        with os.scandir(target) as scanner:
+            for entry in scanner:
+                entries.append(entry)
+
+                if len(entries) > self.MAX_LIST_ITEMS:
+                    break
+
+        truncated = len(entries) > self.MAX_LIST_ITEMS
+        entries = entries[:self.MAX_LIST_ITEMS]
+        entries.sort(key=lambda item: item.name.lower())
+
         items = []
 
-        for item in sorted(target.iterdir()):
-
-            jenis = "Folder" if item.is_dir() else "File"
+        for entry in entries:
+            if entry.is_symlink():
+                jenis = "Link"
+            elif entry.is_dir(follow_symlinks=False):
+                jenis = "Folder"
+            else:
+                jenis = "File"
 
             items.append({
-                "nama": item.name,
+                "nama": entry.name,
                 "jenis": jenis
             })
 
         return {
             "success": True,
             "lokasi": str(target.relative_to(self.workspace)),
-            "items": items
+            "items": items,
+            "terbatas": truncated
         }
 
     def create_file(self, name):
@@ -113,7 +173,8 @@ class ZoraExecutionEngine:
                 "message": "Lokasi tujuan bukan folder."
             }
 
-        target.touch()
+        with target.open("x", encoding="utf-8"):
+            pass
 
         return {
             "success": True,
@@ -136,7 +197,30 @@ class ZoraExecutionEngine:
                 "message": "Lokasi tersebut bukan file."
             }
 
-        content = target.read_text(encoding="utf-8")
+        if target.stat().st_size > self.MAX_READ_SIZE:
+            return {
+                "success": False,
+                "message": "Ukuran file terlalu besar untuk dibaca."
+            }
+
+        with target.open("rb") as file:
+            content_bytes = file.read(
+                self.MAX_READ_SIZE + 1
+            )
+
+        if len(content_bytes) > self.MAX_READ_SIZE:
+            return {
+                "success": False,
+                "message": "Ukuran file terlalu besar untuk dibaca."
+            }
+
+        try:
+            content = content_bytes.decode("utf-8")
+        except UnicodeDecodeError:
+            return {
+                "success": False,
+                "message": "File bukan teks UTF-8 yang valid."
+            }
 
         return {
             "success": True,
@@ -154,6 +238,20 @@ class ZoraExecutionEngine:
                 "message": "Isi file harus berupa teks."
             }
 
+        try:
+            content_bytes = content.encode("utf-8")
+        except UnicodeEncodeError:
+            return {
+                "success": False,
+                "message": "Isi file tidak dapat dikodekan sebagai UTF-8."
+            }
+
+        if len(content_bytes) > self.MAX_WRITE_SIZE:
+            return {
+                "success": False,
+                "message": "Ukuran isi file melebihi batas 1 MB."
+            }
+
         if target.exists() and not target.is_file():
             return {
                 "success": False,
@@ -166,7 +264,34 @@ class ZoraExecutionEngine:
                 "message": "Folder tujuan belum tersedia."
             }
 
-        target.write_text(content, encoding="utf-8")
+        if not target.parent.is_dir():
+            return {
+                "success": False,
+                "message": "Lokasi tujuan bukan folder."
+            }
+
+        temporary_path = None
+
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="wb",
+                dir=target.parent,
+                prefix=".zora-temp-",
+                delete=False
+            ) as temporary_file:
+
+                temporary_path = Path(temporary_file.name)
+                temporary_file.write(content_bytes)
+
+            os.replace(temporary_path, target)
+
+        except OSError:
+            if temporary_path is not None:
+                try:
+                    temporary_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+            raise
 
         return {
             "success": True,
@@ -185,7 +310,8 @@ class ZoraExecutionEngine:
 
     def execute(self, action, parameters=None):
 
-        parameters = parameters or {}
+        if not isinstance(parameters, dict):
+            parameters = {}
 
         if action not in self.ALLOWED_ACTIONS:
             return {
@@ -194,18 +320,25 @@ class ZoraExecutionEngine:
             }
 
         try:
-
             if action == "buat_folder":
-                return self.create_folder(parameters.get("nama"))
+                return self.create_folder(
+                    parameters.get("nama")
+                )
 
             if action == "daftar_file":
-                return self.list_files(parameters.get("lokasi", "."))
+                return self.list_files(
+                    parameters.get("lokasi", ".")
+                )
 
             if action == "buat_file":
-                return self.create_file(parameters.get("nama"))
+                return self.create_file(
+                    parameters.get("nama")
+                )
 
             if action == "baca_file":
-                return self.read_file(parameters.get("nama"))
+                return self.read_file(
+                    parameters.get("nama")
+                )
 
             if action == "tulis_file":
                 return self.write_file(
@@ -214,13 +347,22 @@ class ZoraExecutionEngine:
                 )
 
             if action == "uji_kode":
-                return self.test_code(parameters.get("nama"))
+                return self.test_code(
+                    parameters.get("nama")
+                )
 
-        except (ValueError, PermissionError, OSError, TypeError) as error:
+        except (
+            ValueError,
+            PermissionError,
+            OSError,
+            TypeError,
+            UnicodeError,
+            RecursionError
+        ) as error:
 
             return {
                 "success": False,
-                "message": str(error)
+                "message": str(error) or "Operasi gagal."
             }
 
         return {
