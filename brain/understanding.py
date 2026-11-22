@@ -42,6 +42,25 @@ class ZoraUnderstanding:
 
         return list(unique.values())
 
+    def get_unique_workplaces(self, items):
+        unique = {}
+
+        for item in items:
+            role = item.get("object")
+            location = item.get("location") or ""
+
+            if not isinstance(role, str) or not role.strip():
+                continue
+
+            key = (
+                role.strip().casefold(),
+                location.strip().casefold()
+            )
+
+            unique.setdefault(key, item)
+
+        return list(unique.values())
+
     def conflict_answer(self, subject):
         return (
             f"Saya menemukan beberapa informasi {subject} "
@@ -98,13 +117,13 @@ class ZoraUnderstanding:
                 if item["status"] == "fakta"
             ]
 
-            facts = self.get_unique_objects(facts)
+            workplaces = self.get_unique_workplaces(facts)
 
-            if len(facts) > 1:
-                return self.conflict_answer("pekerjaan")
+            if len(workplaces) > 1:
+                return self.conflict_answer("tempat kerja")
 
-            if facts:
-                item = facts[0]
+            if workplaces:
+                item = workplaces[0]
                 answer = (
                     f"Anda bekerja sebagai {item['object']}."
                 )

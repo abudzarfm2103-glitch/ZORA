@@ -58,17 +58,31 @@ class ZoraCodeQualityEvaluator:
         return values
 
     def get_source_values(self, task, criteria):
-        parameters = criteria.get("semantic_parameters", {})
+        parameters = criteria.get("semantic_parameters")
 
-        if (
-            isinstance(parameters, dict)
-            and "nilai_sumber_a" in parameters
-            and "nilai_sumber_b" in parameters
-        ):
-            return (
-                parameters["nilai_sumber_a"],
-                parameters["nilai_sumber_b"]
-            )
+        if parameters is not None:
+            if (
+                not isinstance(parameters, dict)
+                or set(parameters) != {
+                    "nilai_sumber_a",
+                    "nilai_sumber_b"
+                }
+            ):
+                return None, None
+
+            value_a = parameters["nilai_sumber_a"]
+            value_b = parameters["nilai_sumber_b"]
+
+            if (
+                type(value_a) is not int
+                or type(value_b) is not int
+                or not 1 <= value_a <= 100
+                or not 1 <= value_b <= 100
+                or value_a == value_b
+            ):
+                return None, None
+
+            return value_a, value_b
 
         instruction = str(task.get("instruction", ""))
 
@@ -87,18 +101,164 @@ class ZoraCodeQualityEvaluator:
         if not match_a or not match_b:
             return None, None
 
-        def convert_number(value):
-            number = float(value)
-            return int(number) if number.is_integer() else number
+        try:
+            number_a = float(match_a.group(1))
+            number_b = float(match_b.group(1))
+        except (ValueError, OverflowError):
+            return None, None
 
-        return (
-            convert_number(match_a.group(1)),
-            convert_number(match_b.group(1))
-        )
+        if not number_a.is_integer() or not number_b.is_integer():
+            return None, None
+
+        value_a = int(number_a)
+        value_b = int(number_b)
+
+        if (
+            not 1 <= value_a <= 100
+            or not 1 <= value_b <= 100
+            or value_a == value_b
+        ):
+            return None, None
+
+        return value_a, value_b
+
+    def validate_criteria(self, criteria):
+        if not isinstance(criteria, dict) or not criteria:
+            return "Kriteria evaluasi tidak tersedia."
+
+        allowed_keys = {
+            "required_variables",
+            "expected_variables",
+            "required_operations",
+            "required_control_flow",
+            "require_print",
+            "expected_output",
+            "semantic_type",
+            "semantic_parameters"
+        }
+
+        unknown = set(criteria) - allowed_keys
+        if unknown:
+            return "Ditemukan kriteria yang tidak dikenal."
+
+        def valid_names(values):
+            return (
+                isinstance(values, list)
+                and all(
+                    isinstance(item, str)
+                    and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", item)
+                    for item in values
+                )
+                and len(values) == len(set(values))
+            )
+
+        required_variables = criteria.get("required_variables")
+        if not valid_names(required_variables):
+            return "Format variabel wajib tidak valid."
+
+        if "expected_variables" in criteria:
+            expected = criteria["expected_variables"]
+            if (
+                not isinstance(expected, dict)
+                or not expected
+                or any(
+                    not isinstance(name, str)
+                    or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name)
+                    or type(value) not in (str, int, float, bool, type(None))
+                    for name, value in expected.items()
+                )
+            ):
+                return "Format nilai variabel target tidak valid."
+
+        allowed_operations = {
+            "Add", "Sub", "Mult", "Div", "FloorDiv", "Mod",
+            "Eq", "NotEq", "Lt", "LtE", "Gt", "GtE"
+        }
+
+        operations = criteria.get("required_operations", [])
+        if (
+            not isinstance(operations, list)
+            or any(
+                not isinstance(item, str) or item not in allowed_operations
+                for item in operations
+            )
+            or len(operations) != len(set(operations))
+        ):
+            return "Format operasi wajib tidak valid."
+
+        allowed_control_flow = {"If", "For", "While"}
+        control_flow = criteria.get("required_control_flow", [])
+        if (
+            not isinstance(control_flow, list)
+            or any(
+                not isinstance(item, str) or item not in allowed_control_flow
+                for item in control_flow
+            )
+            or len(control_flow) != len(set(control_flow))
+        ):
+            return "Format struktur kontrol tidak valid."
+
+        if type(criteria.get("require_print", False)) is not bool:
+            return "Format ketentuan print tidak valid."
+
+        expected_output = criteria.get("expected_output")
+        if (
+            not isinstance(expected_output, str)
+            or not expected_output.strip()
+        ):
+            return "Target output wajib berupa teks yang tidak kosong."
+
+        semantic_type = criteria.get("semantic_type")
+        if "semantic_type" in criteria and not isinstance(semantic_type, str):
+            return "Jenis evaluasi semantik tidak valid."
+
+        if "semantic_parameters" in criteria:
+            parameters = criteria["semantic_parameters"]
+
+            if (
+                semantic_type != "source_evaluation"
+                or not isinstance(parameters, dict)
+                or set(parameters) != {
+                    "nilai_sumber_a",
+                    "nilai_sumber_b"
+                }
+            ):
+                return "Parameter evaluasi semantik tidak valid."
+
+        if semantic_type == "source_evaluation":
+            parameters = criteria.get("semantic_parameters")
+
+            if not isinstance(parameters, dict):
+                return "Parameter evaluasi sumber tidak tersedia."
+
+            value_a = parameters.get("nilai_sumber_a")
+            value_b = parameters.get("nilai_sumber_b")
+
+            if type(value_a) is not int or type(value_b) is not int:
+                return "Nilai sumber harus berupa bilangan bulat."
+
+            if (
+                not 1 <= value_a <= 100
+                or not 1 <= value_b <= 100
+            ):
+                return "Nilai sumber harus berada pada rentang 1 sampai 100."
+
+            if value_a == value_b:
+                return "Kedua nilai sumber tidak boleh sama."
+
+        return None
 
     def evaluate_task(self, nodes, output, task):
 
         criteria = task.get("evaluation_criteria", {})
+        validation_error = self.validate_criteria(criteria)
+
+        if validation_error:
+            return {
+                "success": False,
+                "message": validation_error,
+                "checks": {}
+            }
 
         if not isinstance(criteria, dict) or not criteria:
             return {

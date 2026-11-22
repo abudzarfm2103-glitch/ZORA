@@ -1,7 +1,7 @@
 import json
 import os
 import sys
-import uuid
+import tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -11,9 +11,7 @@ sys.path.insert(0, str(ROOT))
 class ZoraSkillPrioritization:
 
     def __init__(self, discovery):
-
         self.discovery = discovery
-
         self.result_file = ROOT / "data" / "zora_skill_priorities.json"
         self.history_file = ROOT / "data" / "zora_autonomous_development_history.json"
         self.capability_file = ROOT / "data" / "zora_capability_report.json"
@@ -42,18 +40,53 @@ class ZoraSkillPrioritization:
         }
 
     def read_json(self, path, default):
+        path = Path(path)
+
+        if path.is_symlink():
+            raise ValueError(f"File JSON tidak boleh berupa symlink: {path}")
+
+        if not path.exists():
+            return default
+
+        if not path.is_file():
+            raise ValueError(f"Lokasi JSON bukan file biasa: {path}")
 
         try:
-            if path.exists():
-                data = json.loads(path.read_text(encoding="utf-8"))
-                return data
-        except (OSError, json.JSONDecodeError):
-            pass
+            return json.loads(path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as error:
+            raise ValueError(
+                f"JSON rusak. File asli dipertahankan: {path} "
+                f"(baris {error.lineno}, kolom {error.colno})"
+            ) from error
+        except OSError as error:
+            raise OSError(
+                f"Gagal membaca JSON: {path}: {error}"
+            ) from error
 
-        return default
+    def validate_history(self, history):
+        if not isinstance(history, list):
+            raise ValueError("Riwayat pengembangan harus berupa daftar.")
+
+        for item in history:
+            if not isinstance(item, dict):
+                raise ValueError("Riwayat mengandung data yang tidak valid.")
+
+            if "success" in item and not isinstance(item["success"], bool):
+                raise ValueError("Status keberhasilan riwayat tidak valid.")
+
+        return history
+
+    def validate_capability_report(self, report):
+        if not isinstance(report, dict):
+            raise ValueError("Laporan kemampuan harus berupa objek.")
+
+        for skill_id, item in report.items():
+            if not isinstance(skill_id, str) or not isinstance(item, dict):
+                raise ValueError("Struktur laporan kemampuan tidak valid.")
+
+        return report
 
     def evaluate_skill(self, skill):
-
         if not isinstance(skill, dict):
             raise ValueError("Data kemampuan tidak valid.")
 
@@ -64,42 +97,34 @@ class ZoraSkillPrioritization:
         if not isinstance(skill_id, str) or not skill_id:
             raise ValueError("ID kemampuan tidak valid.")
 
-        history = self.read_json(self.history_file, [])
-        capability_report = self.read_json(self.capability_file, {})
+        history = self.validate_history(
+            self.read_json(self.history_file, [])
+        )
 
-        if not isinstance(history, list):
-            history = []
-
-        if not isinstance(capability_report, dict):
-            capability_report = {}
+        capability_report = self.validate_capability_report(
+            self.read_json(self.capability_file, {})
+        )
 
         records = [
             item for item in history
-            if isinstance(item, dict)
-            and item.get("skill_id") == skill_id
+            if item.get("skill_id") == skill_id
             and isinstance(item.get("success"), bool)
         ]
 
         capability = capability_report.get(skill_id, {})
-
-        if not isinstance(capability, dict):
-            capability = {}
-
         status = capability.get("status", skill.get("status", "belum_diuji"))
 
         successful = sum(
-            1 for item in records
-            if item.get("success") is True
+            1 for item in records if item["success"] is True
         )
 
         failed = sum(
-            1 for item in records
-            if item.get("success") is False
+            1 for item in records if item["success"] is False
         )
 
         latest_failed = (
             bool(records)
-            and records[-1].get("success") is False
+            and records[-1]["success"] is False
         )
 
         usefulness_map = {
@@ -170,28 +195,64 @@ class ZoraSkillPrioritization:
         }
 
     def save_result(self, result):
-
         self.result_file.parent.mkdir(parents=True, exist_ok=True)
 
-        temporary_file = self.result_file.with_name(
-            f".{self.result_file.name}.{uuid.uuid4().hex}.tmp"
+        if self.result_file.is_symlink():
+            raise ValueError(
+                f"Menolak menimpa symlink: {self.result_file}"
+            )
+
+        if self.result_file.exists():
+            if not self.result_file.is_file():
+                raise ValueError("Target hasil prioritas bukan file biasa.")
+            # Jangan pernah menimpa hasil lama yang JSON-nya rusak.
+            self.read_json(self.result_file, None)
+
+        serialized = json.dumps(
+            result,
+            indent=4,
+            ensure_ascii=False,
+            allow_nan=False
         )
 
-        try:
-            temporary_file.write_text(
-                json.dumps(result, indent=4, ensure_ascii=False),
-                encoding="utf-8"
-            )
-            os.replace(temporary_file, self.result_file)
+        temporary_path = None
 
-        finally:
+        try:
+            fd, temporary_name = tempfile.mkstemp(
+                prefix=f".{self.result_file.name}.",
+                suffix=".tmp",
+                dir=str(self.result_file.parent)
+            )
+            temporary_path = Path(temporary_name)
+
+            with os.fdopen(fd, "w", encoding="utf-8") as file:
+                file.write(serialized)
+                file.flush()
+                os.fsync(file.fileno())
+
+            if self.result_file.is_symlink():
+                raise ValueError("Target hasil berubah menjadi symlink.")
+
+            os.replace(temporary_path, self.result_file)
+            temporary_path = None
+
             try:
-                temporary_file.unlink(missing_ok=True)
+                directory_fd = os.open(self.result_file.parent, os.O_RDONLY)
+                try:
+                    os.fsync(directory_fd)
+                finally:
+                    os.close(directory_fd)
             except OSError:
                 pass
 
-    def prioritize(self):
+        finally:
+            if temporary_path is not None:
+                try:
+                    temporary_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
 
+    def prioritize(self):
         discovery_result = self.discovery.discover()
 
         if (
@@ -208,18 +269,15 @@ class ZoraSkillPrioritization:
             )
 
         if not isinstance(proposals, list):
-            proposals = []
+            raise ValueError("Daftar proposal discovery tidak valid.")
 
         if not isinstance(new_candidates, list):
-            new_candidates = []
+            raise ValueError("Daftar kandidat baru tidak valid.")
 
         evaluated = []
 
         for skill in proposals:
-            try:
-                evaluated.append(self.evaluate_skill(skill))
-            except (ValueError, TypeError, KeyError) as error:
-                print("Peringatan: kandidat dilewati:", error)
+            evaluated.append(self.evaluate_skill(skill))
 
         evaluated.sort(
             key=lambda item: (
@@ -238,23 +296,16 @@ class ZoraSkillPrioritization:
         }
 
         self.save_result(result)
-
         return result
 
     def report(self):
-
         result = self.prioritize()
 
         print("\nZORA AUTONOMOUS SKILL PRIORITIZATION")
         print("------------------------------------")
 
         for item in result["all_priorities"]:
-
-            print(
-                f"\nPeringkat {item['rank']}: "
-                f"{item['name']}"
-            )
-
+            print(f"\nPeringkat {item['rank']}: {item['name']}")
             print("ID usulan:", item["id"])
             print("ID kemampuan:", item["skill_id"])
             print("Status:", item["status"])
@@ -280,7 +331,6 @@ class ZoraSkillPrioritization:
 
 
 def main():
-
     from brain.zora import Zora
     from developer.self_development import ZoraSelfDevelopment
     from developer.development_planner import ZoraDevelopmentPlanner
@@ -292,10 +342,8 @@ def main():
         developer = ZoraSelfDevelopment(zora)
         planner = ZoraDevelopmentPlanner(developer)
         discovery = ZoraSkillDiscovery(planner)
-
         prioritization = ZoraSkillPrioritization(discovery)
         prioritization.report()
-
     finally:
         zora.memory.close()
 

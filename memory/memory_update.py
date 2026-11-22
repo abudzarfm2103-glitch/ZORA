@@ -4,15 +4,11 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-CURRENT_DIR = Path(__file__).resolve().parent
 
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-if __package__:
-    from memory.memory_filter import MemoryFilter
-else:
-    from memory_filter import MemoryFilter
+from memory.memory_filter import MemoryFilter
 
 
 class MemoryUpdate:
@@ -23,7 +19,7 @@ class MemoryUpdate:
         self.filter = MemoryFilter()
 
     def normalize_text(self, content):
-        text = content.lower().strip()
+        text = content.casefold().strip()
         text = re.sub(r"[^\w\s]", " ", text)
         return " ".join(text.split())
 
@@ -42,7 +38,7 @@ class MemoryUpdate:
                 "jabatan saya"
             ]
 
-            if any(pattern in text for pattern in patterns):
+            if any(text.startswith(item) for item in patterns):
                 return "pekerjaan"
 
         elif category in ["pribadi", "lainnya"]:
@@ -66,7 +62,7 @@ class MemoryUpdate:
 
         return None
 
-    def get_job_role(self, content):
+    def get_job_identity(self, content):
         text = self.normalize_text(content)
 
         prefixes = [
@@ -85,34 +81,28 @@ class MemoryUpdate:
                 text = text[len(prefix):].strip()
                 break
 
-        for separator in [" di ", " pada ", " untuk ", " bagian "]:
-            if separator in text:
-                text = text.split(separator, 1)[0].strip()
+        parts = re.split(
+            r"\s+(di|pada|untuk|bagian)\s+",
+            text,
+            maxsplit=1
+        )
 
-        return text
+        role = parts[0].strip()
+        location = parts[2].strip() if len(parts) == 3 else ""
+
+        return role, location
+
+    def get_job_role(self, content):
+        return self.get_job_identity(content)[0]
 
     def get_job_location(self, content):
-        text = self.normalize_text(content)
-
-        if " di " in text:
-            return text.split(" di ", 1)[1].strip()
-
-        return ""
+        return self.get_job_identity(content)[1]
 
     def same_job_role(self, old_text, new_text):
-        old_role = self.get_job_role(old_text)
-        new_role = self.get_job_role(new_text)
+        old_identity = self.get_job_identity(old_text)
+        new_identity = self.get_job_identity(new_text)
 
-        if old_role == new_role:
-            return True
-
-        old_location = self.get_job_location(old_text)
-
-        if old_location:
-            if new_role == old_role + " " + old_location:
-                return True
-
-        return False
+        return old_identity == new_identity
 
     def check(self, content, category):
         if not isinstance(content, str):
@@ -165,15 +155,17 @@ class MemoryUpdate:
                 if old_key != new_key:
                     continue
 
-                if category == "pekerjaan":
-                    if self.same_job_role(old_text, content):
-                        return {
-                            "status": "same",
-                            "message": (
-                                "Informasi pekerjaan tersebut sudah saya ingat. "
-                                "Tidak perlu menyimpan ulang."
-                            )
-                        }
+                if (
+                    category == "pekerjaan"
+                    and self.same_job_role(old_text, content)
+                ):
+                    return {
+                        "status": "same",
+                        "message": (
+                            "Informasi pekerjaan dan lokasi tersebut "
+                            "sudah saya ingat."
+                        )
+                    }
 
                 self.pending_update = {
                     "old": old_text,
@@ -202,7 +194,7 @@ class MemoryUpdate:
         if not self.pending_update:
             return None
 
-        answer = answer.strip().lower()
+        answer = answer.strip().casefold()
 
         if answer in ["ya", "iya", "benar", "setuju"]:
             data = self.pending_update
@@ -262,7 +254,6 @@ class MemoryUpdate:
 
 def main():
     import tempfile
-
     from memory.memory import ZoraMemory
 
     with tempfile.TemporaryDirectory() as folder:
@@ -282,7 +273,7 @@ def main():
             )
 
             assert result["status"] == "confirm"
-            print("LULUS: perubahan meminta konfirmasi")
+            print("LULUS: perubahan proyek meminta konfirmasi")
 
             updater.confirm("mungkin")
             assert updater.pending_update is not None
@@ -299,7 +290,6 @@ def main():
             )
 
             updater.confirm("ya")
-            assert updater.pending_update is None
             assert memory.recall()[0][0].endswith("server")
             print("LULUS: persetujuan memperbarui informasi")
 

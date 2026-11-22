@@ -9,7 +9,6 @@ class MemoryFilter:
             "umur saya",
             "saya tinggal"
         ],
-
         "pekerjaan": [
             "saya bekerja",
             "pekerjaan saya",
@@ -19,7 +18,6 @@ class MemoryFilter:
             "saat ini saya bekerja",
             "sekarang saya bekerja"
         ],
-
         "proyek": [
             "proyek saya",
             "saya sedang mengembangkan",
@@ -40,7 +38,6 @@ class MemoryFilter:
             "zora saat ini beroperasi di",
             "server zora"
         ],
-
         "preferensi": [
             "saya suka",
             "saya lebih suka",
@@ -49,26 +46,41 @@ class MemoryFilter:
     }
 
     IGNORE_WORDS = [
-        "halo",
-        "hai",
-        "selamat pagi",
-        "selamat malam",
-        "terima kasih",
-        "oke",
-        "baik",
-        "sudah",
-        "iya"
+        "halo", "hai", "selamat pagi", "selamat malam",
+        "terima kasih", "oke", "baik", "sudah", "iya"
     ]
 
-    PLAN_WORDS = [
-        "akan",
-        "nantinya",
-        "berencana",
-        "rencana",
-        "ingin",
-        "berniat",
-        "direncanakan",
-        "target saya"
+    QUESTION_STARTS = [
+        "apakah", "apa", "siapa", "dimana", "di mana",
+        "kapan", "mengapa", "kenapa", "bagaimana",
+        "bisakah", "bolehkah", "adakah"
+    ]
+
+    HYPOTHETICAL_STARTS = [
+        "kalau", "jika", "seandainya", "andaikan",
+        "misalnya", "bagaimana jika"
+    ]
+
+    NEGATIVE_PLAN_PATTERNS = [
+        r"\btidak\s+ingin\b",
+        r"\bbelum\s+ingin\b",
+        r"\btidak\s+akan\b",
+        r"\btidak\s+berencana\b",
+        r"\btidak\s+berniat\b",
+        r"\bbukan\s+rencana\b"
+    ]
+
+    PLAN_PATTERNS = [
+        r"\bsaya\s+akan\b",
+        r"\bsaya\s+ingin\b",
+        r"\bsaya\s+berencana\b",
+        r"\bsaya\s+berniat\b",
+        r"\brencana\s+saya\b",
+        r"\btarget\s+saya\b",
+        r"\bzora\s+nantinya\s+akan\b",
+        r"\bzora\s+akan\b",
+        r"\bzora\s+direncanakan\b",
+        r"\bdirencanakan\s+berjalan\b"
     ]
 
     FACT_PATTERNS = [
@@ -97,22 +109,54 @@ class MemoryFilter:
     ]
 
     def contains_phrase(self, text, phrase):
-        pattern = (
-            r"(?<!\w)"
-            + re.escape(phrase)
-            + r"(?!\w)"
-        )
+        pattern = r"(?<!\w)" + re.escape(phrase) + r"(?!\w)"
         return re.search(pattern, text) is not None
 
-    def determine_status(self, text):
-        lower_text = text.lower()
+    def is_question_or_hypothetical(self, text):
+        lower = text.casefold().strip()
 
-        for word in self.PLAN_WORDS:
-            if self.contains_phrase(lower_text, word):
-                return "rencana"
+        if "?" in lower:
+            return True
+
+        if any(
+            lower.startswith(word + " ")
+            or lower == word
+            for word in self.QUESTION_STARTS
+        ):
+            return True
+
+        if any(
+            lower.startswith(word + " ")
+            or lower == word
+            for word in self.HYPOTHETICAL_STARTS
+        ):
+            return True
+
+        return False
+
+    def determine_status(self, text):
+        if not isinstance(text, str):
+            return "belum_diklasifikasikan"
+
+        lower = " ".join(text.casefold().split())
+
+        if self.is_question_or_hypothetical(lower):
+            return "belum_diklasifikasikan"
+
+        if any(
+            re.search(pattern, lower)
+            for pattern in self.NEGATIVE_PLAN_PATTERNS
+        ):
+            return "belum_diklasifikasikan"
+
+        if any(
+            re.search(pattern, lower)
+            for pattern in self.PLAN_PATTERNS
+        ):
+            return "rencana"
 
         for pattern in self.FACT_PATTERNS:
-            if self.contains_phrase(lower_text, pattern):
+            if self.contains_phrase(lower, pattern):
                 return "fakta"
 
         return "belum_diklasifikasikan"
@@ -122,17 +166,26 @@ class MemoryFilter:
             return None
 
         text = " ".join(message.strip().split())
-        lower_text = text.lower()
+        lower = text.casefold()
 
         if not text or len(text) < 5:
             return None
 
-        if lower_text in self.IGNORE_WORDS:
+        if lower in self.IGNORE_WORDS:
+            return None
+
+        if self.is_question_or_hypothetical(text):
+            return None
+
+        if any(
+            re.search(pattern, lower)
+            for pattern in self.NEGATIVE_PLAN_PATTERNS
+        ):
             return None
 
         for category, keywords in self.KEYWORDS.items():
             for keyword in keywords:
-                if self.contains_phrase(lower_text, keyword):
+                if self.contains_phrase(lower, keyword):
                     return {
                         "content": text,
                         "category": category,

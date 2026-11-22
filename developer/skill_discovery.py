@@ -1,7 +1,8 @@
-
 import json
+import os
 import re
 import sys
+import tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -13,12 +14,9 @@ from developer.capability_evaluator import ZoraCapabilityEvaluator
 class ZoraSkillDiscovery:
 
     def __init__(self, planner):
-
         self.planner = planner
-
         self.proposal_file = ROOT / "data" / "zora_skill_proposals.json"
         self.candidate_file = ROOT / "data" / "zora_new_skill_candidates.json"
-
         self.capability_evaluator = ZoraCapabilityEvaluator()
 
         self.priorities = {
@@ -29,26 +27,109 @@ class ZoraSkillDiscovery:
         }
 
     def read_json(self, path, default):
+        path = Path(path)
+
+        if path.is_symlink():
+            raise ValueError(f"File JSON tidak boleh berupa symlink: {path}")
+
+        if not path.exists():
+            return default
+
+        if not path.is_file():
+            raise ValueError(f"Lokasi JSON bukan file biasa: {path}")
 
         try:
-            if path.exists():
-                return json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            pass
-
-        return default
+            return json.loads(path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as error:
+            raise ValueError(
+                f"JSON rusak. File asli dipertahankan: {path} "
+                f"(baris {error.lineno}, kolom {error.colno})"
+            ) from error
+        except OSError as error:
+            raise OSError(
+                f"Gagal membaca JSON: {path}: {error}"
+            ) from error
 
     def save_json(self, path, data):
-
+        path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
 
-        path.write_text(
-            json.dumps(data, indent=4, ensure_ascii=False),
-            encoding="utf-8"
+        if path.is_symlink():
+            raise ValueError(f"Menolak menimpa symlink: {path}")
+
+        if path.exists():
+            if not path.is_file():
+                raise ValueError(f"Target penyimpanan bukan file biasa: {path}")
+            # Pastikan file lama valid sebelum mengizinkan penggantian.
+            self.read_json(path, None)
+
+        serialized = json.dumps(
+            data,
+            indent=4,
+            ensure_ascii=False,
+            allow_nan=False
         )
 
-    def get_brain(self):
+        temporary_path = None
 
+        try:
+            fd, temporary_name = tempfile.mkstemp(
+                prefix=f".{path.name}.",
+                suffix=".tmp",
+                dir=str(path.parent)
+            )
+            temporary_path = Path(temporary_name)
+
+            with os.fdopen(fd, "w", encoding="utf-8") as file:
+                file.write(serialized)
+                file.flush()
+                os.fsync(file.fileno())
+
+            if path.is_symlink():
+                raise ValueError(f"Target berubah menjadi symlink: {path}")
+
+            os.replace(temporary_path, path)
+            temporary_path = None
+
+            try:
+                directory_fd = os.open(path.parent, os.O_RDONLY)
+                try:
+                    os.fsync(directory_fd)
+                finally:
+                    os.close(directory_fd)
+            except OSError:
+                pass
+
+        finally:
+            if temporary_path is not None:
+                try:
+                    temporary_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+
+    def validate_candidates(self, candidates):
+        if not isinstance(candidates, list):
+            raise ValueError("Data kandidat kemampuan harus berupa daftar.")
+
+        seen = set()
+
+        for item in candidates:
+            if not isinstance(item, dict):
+                raise ValueError("Data kandidat mengandung objek yang tidak valid.")
+
+            candidate_id = item.get("id")
+
+            if not isinstance(candidate_id, str) or not candidate_id:
+                raise ValueError("ID kandidat kemampuan tidak valid.")
+
+            if candidate_id in seen:
+                raise ValueError(f"ID kandidat duplikat: {candidate_id}")
+
+            seen.add(candidate_id)
+
+        return candidates
+
+    def get_brain(self):
         developer = getattr(self.planner, "developer", None)
         zora = getattr(developer, "zora", None)
         brain = getattr(zora, "brain", None)
@@ -59,7 +140,6 @@ class ZoraSkillDiscovery:
         return None
 
     def extract_field(self, response, label):
-
         pattern = (
             r"(?im)^\s*" + re.escape(label)
             + r"\s*:\s*(.*?)\s*$"
@@ -73,6 +153,12 @@ class ZoraSkillDiscovery:
         return ""
 
     def analyze_new_capabilities(self, report, plan):
+        if not isinstance(report, dict):
+            raise ValueError("Laporan kemampuan harus berupa objek JSON.")
+
+        previous = self.validate_candidates(
+            self.read_json(self.candidate_file, [])
+        )
 
         brain = self.get_brain()
 
@@ -81,18 +167,10 @@ class ZoraSkillDiscovery:
             return []
 
         existing_ids = list(report.keys())
-
-        previous = self.read_json(
-            self.candidate_file,
-            []
-        )
-
         known_ids = set(existing_ids)
 
-        if isinstance(previous, list):
-            for item in previous:
-                if isinstance(item, dict):
-                    known_ids.add(item.get("id"))
+        for item in previous:
+            known_ids.add(item["id"])
 
         evidence = {
             skill_id: {
@@ -146,12 +224,8 @@ Jangan menambahkan teks di luar lima baris.
 """
 
         try:
-
             response = brain.think([
-                {
-                    "role": "user",
-                    "content": prompt
-                }
+                {"role": "user", "content": prompt}
             ])
 
             if not isinstance(response, str):
@@ -183,11 +257,7 @@ Jangan menambahkan teks di luar lima baris.
                 print("AI mengusulkan kemampuan yang sudah ada.")
                 return []
 
-            if candidate["id"] in (
-                "tidak_ada",
-                "none",
-                "null"
-            ):
+            if candidate["id"] in ("tidak_ada", "none", "null"):
                 return []
 
             candidate.update({
@@ -200,21 +270,26 @@ Jangan menambahkan teks di luar lima baris.
             return [candidate]
 
         except Exception as error:
-
             print("Analisis kemampuan AI gagal:", str(error))
             return []
 
     def discover(self):
-
         print("\nZORA sedang menganalisis kebutuhan pengembangan...")
 
-        report = self.capability_evaluator.evaluate()
-        plan = self.planner.create_plan()
+        # Baca dan validasi data lama sebelum menyimpan apa pun.
+        previous = self.validate_candidates(
+            self.read_json(self.candidate_file, [])
+        )
 
+        report = self.capability_evaluator.evaluate()
+
+        if not isinstance(report, dict):
+            raise ValueError("Laporan evaluasi kemampuan tidak valid.")
+
+        plan = self.planner.create_plan()
         discovered = []
 
         for skill_id, result in report.items():
-
             if not isinstance(result, dict):
                 continue
 
@@ -265,45 +340,29 @@ Jangan menambahkan teks di luar lima baris.
             key=lambda item: (item["priority"], item["name"])
         )
 
-        self.save_json(self.proposal_file, discovered)
+        candidates = self.analyze_new_capabilities(report, plan)
 
-        candidates = self.analyze_new_capabilities(
-            report,
-            plan
-        )
-
-        previous = self.read_json(self.candidate_file, [])
-
-        if not isinstance(previous, list):
-            previous = []
-
-        known_ids = {
-            item.get("id")
-            for item in previous
-            if isinstance(item, dict)
-        }
+        known_ids = {item["id"] for item in previous}
 
         for candidate in candidates:
-
             if candidate["id"] not in known_ids:
                 previous.append(candidate)
                 known_ids.add(candidate["id"])
 
+        # Simpan setelah seluruh data lama berhasil dibaca dan divalidasi.
+        self.save_json(self.proposal_file, discovered)
         self.save_json(self.candidate_file, previous)
 
         return discovered, candidates
 
     def report(self):
-
         proposals, candidates = self.discover()
 
         print("\nZORA AUTONOMOUS SKILL DISCOVERY")
         print("--------------------------------")
-
         print("\nKEBUTUHAN KEMAMPUAN SAAT INI")
 
         for item in proposals:
-
             print("\nKemampuan:", item["name"])
             print("ID:", item["skill_id"])
             print("Status:", item["status"])
@@ -317,7 +376,6 @@ Jangan menambahkan teks di luar lima baris.
             print("Belum ada usulan baru yang lolos validasi AI.")
 
         for item in candidates:
-
             print("\nCalon kemampuan:", item["name"])
             print("ID:", item["id"])
             print("Alasan:", item["reason"])
@@ -333,7 +391,6 @@ Jangan menambahkan teks di luar lima baris.
 
 
 def main():
-
     from brain.zora import Zora
     from developer.self_development import ZoraSelfDevelopment
     from developer.development_planner import ZoraDevelopmentPlanner
@@ -341,13 +398,10 @@ def main():
     zora = Zora()
 
     try:
-
         developer = ZoraSelfDevelopment(zora)
         planner = ZoraDevelopmentPlanner(developer)
-
         discovery = ZoraSkillDiscovery(planner)
         discovery.report()
-
     finally:
         zora.memory.close()
 

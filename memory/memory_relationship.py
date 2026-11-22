@@ -1,3 +1,6 @@
+import re
+
+
 class MemoryRelationship:
 
     STATUS_PRIORITY = {
@@ -11,39 +14,55 @@ class MemoryRelationship:
         self.memory = memory
 
     def extract_work_relationship(self, content, status):
-        text = content.lower().strip()
+        if not isinstance(content, str):
+            return None
+
+        text = content.strip()
 
         prefixes = [
             "saya bekerja sebagai",
             "saya menjabat sebagai"
         ]
 
-        for prefix in prefixes:
-            if text.startswith(prefix):
-                detail = content[len(prefix):].strip()
+        prefix = next(
+            (
+                item for item in prefixes
+                if text.lower().startswith(item)
+            ),
+            None
+        )
 
-                if " di " in detail.lower():
-                    parts = detail.split(" di ", 1)
+        if not prefix:
+            return None
 
-                    return {
-                        "subject": "Pengguna",
-                        "relation": "bekerja_sebagai",
-                        "object": parts[0].strip(),
-                        "location": parts[1].strip(),
-                        "status": status
-                    }
+        detail = text[len(prefix):].strip()
 
-                return {
-                    "subject": "Pengguna",
-                    "relation": "bekerja_sebagai",
-                    "object": detail,
-                    "location": None,
-                    "status": status
-                }
+        if not detail:
+            return None
 
-        return None
+        parts = re.split(r"\s+di\s+", detail, maxsplit=1, flags=re.I)
+
+        role = parts[0].strip()
+        location = parts[1].strip() if len(parts) > 1 else None
+
+        if not role:
+            return None
+
+        if location == "":
+            location = None
+
+        return {
+            "subject": "Pengguna",
+            "relation": "bekerja_sebagai",
+            "object": role,
+            "location": location,
+            "status": status
+        }
 
     def extract_project_relationship(self, content, status):
+        if not isinstance(content, str):
+            return None
+
         text = content.lower()
 
         patterns = [
@@ -66,9 +85,7 @@ class MemoryRelationship:
                 continue
 
             location_start = position + len(pattern)
-            location = content[location_start:].strip(
-                " .,!?:;"
-            )
+            location = content[location_start:].strip(" .,!?:;")
 
             if not location:
                 continue
@@ -109,10 +126,13 @@ class MemoryRelationship:
             if not relationship:
                 continue
 
+            location = relationship.get("location") or ""
+
             key = (
-                relationship["subject"],
-                relationship["relation"],
-                relationship["object"].lower()
+                relationship["subject"].casefold(),
+                relationship["relation"].casefold(),
+                relationship["object"].strip().casefold(),
+                location.strip().casefold()
             )
 
             priority = self.STATUS_PRIORITY.get(status, 0)
@@ -122,10 +142,7 @@ class MemoryRelationship:
                 continue
 
             old_status = selected[key]["status"]
-            old_priority = self.STATUS_PRIORITY.get(
-                old_status,
-                0
-            )
+            old_priority = self.STATUS_PRIORITY.get(old_status, 0)
 
             if priority > old_priority:
                 selected[key] = relationship
@@ -168,3 +185,71 @@ class MemoryRelationship:
             )
 
         return "\n".join(results)
+
+
+def main():
+    import tempfile
+    from pathlib import Path
+    from memory.memory import ZoraMemory
+
+    with tempfile.TemporaryDirectory() as folder:
+        memory = ZoraMemory(Path(folder) / "test.db")
+
+        try:
+            memory.save(
+                "Saya bekerja sebagai Supervisor di DC Senen",
+                "pekerjaan",
+                "fakta"
+            )
+
+            memory.save(
+                "Saya bekerja sebagai Supervisor di DC Cakung",
+                "pekerjaan",
+                "fakta"
+            )
+
+            relationship = MemoryRelationship(memory)
+            results = relationship.build_relationships()
+
+            locations = {
+                item.get("location")
+                for item in results
+                if item["relation"] == "bekerja_sebagai"
+            }
+
+            assert "DC Senen" in locations
+            assert "DC Cakung" in locations
+            assert len(results) == 2
+            print("LULUS: jabatan sama dengan lokasi berbeda tetap dipisahkan")
+
+            memory.save(
+                "Saya bekerja sebagai Admin di DC Senen",
+                "pekerjaan",
+                "rencana"
+            )
+
+            memory.save(
+                "Saya menjabat sebagai Admin di DC Senen",
+                "pekerjaan",
+                "fakta"
+            )
+
+            results = relationship.build_relationships()
+
+            admin = [
+                item for item in results
+                if item["object"] == "Admin"
+            ]
+
+            assert len(admin) == 1
+            assert admin[0]["status"] == "fakta"
+            print("LULUS: fakta diprioritaskan dari rencana yang sama")
+
+            print("\nHASIL: 2/2 pengujian hubungan memori lulus")
+
+        finally:
+            memory.close()
+
+
+if __name__ == "__main__":
+    main()
