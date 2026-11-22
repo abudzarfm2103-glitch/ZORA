@@ -19,6 +19,9 @@ from developer.execution_engine import ZoraExecutionEngine
 from developer.command_understanding import ZoraCommandUnderstanding
 from developer.code_generator import ZoraCodeGenerator
 
+from brain.web_search import WebSearch
+from brain.web_reader import WebReader
+
 
 class Zora:
 
@@ -50,6 +53,8 @@ class Zora:
 
         self.execution = ZoraExecutionEngine()
         self.command_understanding = ZoraCommandUnderstanding()
+        self.web_search = WebSearch()
+        self.web_reader = WebReader()
 
         self.code_generator = ZoraCodeGenerator(
             self.brain,
@@ -219,6 +224,112 @@ class Zora:
 
             self.conversation.remember_zora(jawaban)
             return jawaban
+
+
+        # Internet hanya diakses jika pengguna meminta secara eksplisit.
+        search_prefixes = (
+            "cari di internet tentang ",
+            "telusuri internet tentang ",
+            "cari di internet ",
+            "telusuri internet ",
+            "cari di internet",
+            "telusuri internet",
+        )
+
+        read_prefixes = (
+            "baca halaman ",
+            "buka halaman web ",
+            "baca url ",
+            "baca halaman",
+            "buka halaman web",
+            "baca url",
+        )
+
+        web_response = None
+
+        for prefix in search_prefixes:
+            if perintah.startswith(prefix):
+                query = message[len(prefix):].strip()
+
+                if not query:
+                    web_response = "Apa yang ingin saya cari di internet?"
+                else:
+                    result = self.web_search.search(query)
+
+                    if not result.get("success"):
+                        web_response = (
+                            "Pencarian internet gagal: "
+                            + str(result.get("error", "Kesalahan tidak diketahui."))
+                        )
+                    elif not result.get("results"):
+                        web_response = "Saya tidak menemukan hasil pencarian."
+                    else:
+                        sources = result["results"]
+                        external_data = json.dumps(
+                            sources, ensure_ascii=False
+                        )
+                        summary = self.brain.summarize_external_data(
+                            query, external_data
+                        )
+
+                        lines = [
+                            "HASIL ANALISIS ZORA",
+                            summary,
+                            "",
+                            "SUMBER INFORMASI:"
+                        ]
+
+                        for index, item in enumerate(sources, 1):
+                            lines.extend([
+                                f"{index}. {item.get('title') or 'Tanpa judul'}",
+                                item.get("url", "")
+                            ])
+
+                        web_response = "\n".join(lines)
+                break
+
+        if web_response is None:
+            for prefix in read_prefixes:
+                if perintah.startswith(prefix):
+                    url = message[len(prefix):].strip()
+
+                    if not url:
+                        web_response = (
+                            "Silakan berikan alamat halaman web yang ingin dibaca."
+                        )
+                    else:
+                        result = self.web_reader.read(url)
+
+                        if not result.get("success"):
+                            web_response = (
+                                "Halaman web gagal dibaca: "
+                                + str(result.get("error", "Kesalahan tidak diketahui."))
+                            )
+                        else:
+                            title = result.get("title", "Tanpa judul")
+                            source = result.get("url", url)
+                            external_data = json.dumps({
+                                "judul": title,
+                                "alamat_sumber": source,
+                                "isi_halaman": result.get("content", ""),
+                                "terpotong": result.get("truncated", False)
+                            }, ensure_ascii=False)
+
+                            summary = self.brain.summarize_external_data(
+                                "Rangkum dan jelaskan isi halaman ini.",
+                                external_data
+                            )
+
+                            web_response = (
+                                "HASIL ANALISIS ZORA\n"
+                                + summary
+                                + "\n\nSumber: " + source
+                            )
+                    break
+
+        if web_response is not None:
+            self.conversation.remember_zora(web_response)
+            return web_response
 
         command = self.command_understanding.understand(message)
 
