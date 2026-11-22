@@ -28,38 +28,64 @@ class ZoraSelfRepair:
         )
 
     def validate_code(self, code):
-
         if not isinstance(code, str):
             raise ValueError("Kode harus berupa teks.")
 
         maximum = self.zora.execution.MAX_WRITE_SIZE
 
         if len(code.encode("utf-8")) > maximum:
-            raise ValueError(
-                "Ukuran kode melebihi batas penyimpanan."
-            )
+            raise ValueError("Ukuran kode melebihi batas penyimpanan.")
 
         tree = ast.parse(code)
-
         self.zora.execution.sandbox.validate_code(tree)
 
         return True
 
     def cleanup_created_file(self, target):
-
         try:
-            if target.is_file() or target.is_symlink():
-                target.unlink()
-                print("File percobaan yang gagal telah dibersihkan.")
+            if not isinstance(target, Path):
+                return False
 
-        except OSError as error:
+            workspace = Path(
+                self.zora.execution.workspace
+            ).resolve()
+
+            try:
+                relative = target.relative_to(workspace)
+            except ValueError:
+                print("Peringatan: penghapusan di luar workspace ditolak.")
+                return False
+
+            if not relative.parts:
+                return False
+
+            safe_target = self.zora.execution.validate_path(
+                relative.as_posix()
+            )
+
+            if safe_target != target:
+                print("Peringatan: lokasi file tidak cocok.")
+                return False
+
+            if safe_target.is_symlink():
+                print("Peringatan: penghapusan symlink ditolak.")
+                return False
+
+            if not safe_target.is_file():
+                return False
+
+            safe_target.unlink()
+            print("File percobaan yang gagal telah dibersihkan.")
+            return True
+
+        except (OSError, ValueError, PermissionError, TypeError) as error:
             print(
                 "Peringatan: file gagal dibersihkan:",
                 str(error)
             )
+            return False
 
     def run(self, instruction, filename, initial_code=None):
-
         if not isinstance(instruction, str) or not instruction.strip():
             return {
                 "success": False,
@@ -68,7 +94,6 @@ class ZoraSelfRepair:
 
         try:
             target = self.zora.execution.validate_path(filename)
-
         except (ValueError, PermissionError, OSError) as error:
             return {
                 "success": False,
@@ -82,7 +107,6 @@ class ZoraSelfRepair:
             }
 
         if initial_code is None:
-
             generated = self.zora.generate_code(instruction)
 
             if not isinstance(generated, dict):
@@ -95,13 +119,11 @@ class ZoraSelfRepair:
                 return generated
 
             code = generated.get("code")
-
         else:
             code = initial_code
 
         try:
             self.validate_code(code)
-
         except (
             SyntaxError,
             ValueError,
@@ -126,14 +148,12 @@ class ZoraSelfRepair:
             return saved
 
         for attempt in range(self.max_attempts + 1):
-
             print(f"\nPengujian ke-{attempt + 1}...")
 
             result = self.zora.execution.test_code(filename)
 
             if not isinstance(result, dict):
                 self.cleanup_created_file(target)
-
                 return {
                     "success": False,
                     "message": "Hasil pengujian Sandbox tidak valid.",
@@ -141,7 +161,6 @@ class ZoraSelfRepair:
                 }
 
             if result.get("success"):
-
                 return {
                     "success": True,
                     "message": "Kode berhasil diperbaiki dan diuji.",
@@ -182,7 +201,6 @@ Hasilkan hanya kode Python.
 
             if not isinstance(repaired, dict) or not repaired.get("success"):
                 self.cleanup_created_file(target)
-
                 return {
                     "success": False,
                     "message": (
@@ -197,7 +215,6 @@ Hasilkan hanya kode Python.
 
             try:
                 self.validate_code(new_code)
-
             except (
                 SyntaxError,
                 ValueError,
@@ -205,14 +222,10 @@ Hasilkan hanya kode Python.
                 TypeError,
                 UnicodeError
             ) as error:
-
                 print("Kode perbaikan ditolak:", str(error))
                 continue
 
-            saved = self.zora.execution.write_file(
-                filename,
-                new_code
-            )
+            saved = self.zora.execution.write_file(filename, new_code)
 
             if not saved.get("success"):
                 self.cleanup_created_file(target)
@@ -233,7 +246,6 @@ Hasilkan hanya kode Python.
 
 
 def main():
-
     zora = Zora()
 
     try:
