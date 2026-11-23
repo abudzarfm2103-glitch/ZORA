@@ -85,15 +85,28 @@ class TestWebSearch(unittest.TestCase):
         self.assertEqual(result["backend"], "yahoo")
 
     def test_translation_not_needed_for_english_query(self):
+        fake_results = [
+            {
+                "title": "Latest AI Technology",
+                "body": "Artificial intelligence developments.",
+                "href": "https://example.com/ai"
+            }
+        ]
+
         with patch.object(
             self.searcher,
             "_translate_query"
-        ) as mock_translate:
-            self.assertIsNone(
-                self.searcher._translate_query(
-                    "latest artificial intelligence technology"
-                )
+        ) as mock_translate, patch(
+            "brain.web_search.DDGS"
+        ) as mock_ddgs:
+
+            mock_ddgs.return_value.text.return_value = fake_results
+
+            result = self.searcher.search(
+                "latest artificial intelligence technology"
             )
+
+            self.assertTrue(result["success"])
             mock_translate.assert_not_called()
 
     def test_translation_failure_does_not_crash_search(self):
